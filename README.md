@@ -9,7 +9,7 @@ Turn a video (or a YouTube link) into a pencil-and-ink sketch: one drawing per s
 - Python 3.10+
 - PowerShell 7+ for the `scribble.ps1` launcher (Windows, macOS or Linux), or call the Python script directly
 
-```
+```shell
 python -m pip install -r requirements.txt
 ```
 
@@ -27,7 +27,7 @@ Quote links in PowerShell, since `&` is special there. Without PowerShell, run `
 
 Each video gets its own folder, named after its title:
 
-```
+```text
 scribble/<title-slug>/
   frames/frame_001_0m01.63s.png   one drawing per shot, from the middle of the shot
   contact_sheet.png               every shot on one page
@@ -40,7 +40,7 @@ Links are downloaded into `source/`, and running again reuses that file.
 ### Options
 
 | Option | Default | |
-|---|---|---|
+| --- | --- | --- |
 | `-o, --out DIR` | `scribble/<title-slug>` | output folder |
 | `--no-video` | | skip the sketch video; only make the drawings and contact sheet |
 | `--threshold N` | `0.3` | scene-change sensitivity, 0 to 1; lower finds more shots |
