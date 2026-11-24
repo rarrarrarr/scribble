@@ -1,0 +1,2 @@
+# keep LF so the #!/usr/bin/env pwsh shebang works on Linux/macOS
+*.ps1 text eol=lf

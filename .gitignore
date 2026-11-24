@@ -1,0 +1,6 @@
+__pycache__/
+
+# generated / downloaded media (large, and copies of copyrighted videos)
+source/
+audio/
+scribble/
