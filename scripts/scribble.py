@@ -3,6 +3,7 @@
 Pure image code (OpenCV/numpy), no I/O. Used by make_scribble.py.
 """
 import math
+import threading
 
 import cv2
 import numpy as np
@@ -12,7 +13,7 @@ class Sketcher:
     """Converts BGR frames of a fixed size into sketch-style BGR frames.
 
     Paper grain and hatch textures are generated once per instance so a video
-    doesn't "boil" from frame to frame.
+    doesn't "boil" from frame to frame. Safe to call from several threads at once.
     """
 
     def __init__(self, width, height, seed=7):
@@ -25,7 +26,21 @@ class Sketcher:
         self.hatches = [(self._hatch(45, 6, 1), 0.55),
                         (self._hatch(-45, 6, 2), 0.35),
                         (self._hatch(0, 5, 3), 0.18)]
-        self.clahe = cv2.createCLAHE(2.0, (8, 8))
+        # how dark each hatch layer makes the paper where it is fully on
+        self.hatch_dark = [(((1.0 - tex) * 0.75).astype(np.float32), thr) for tex, thr in self.hatches]
+        # pencil (colour-dodge of gray with its blurred inverse, then a gamma) depends only
+        # on two uint8 values, so precompute it as a 256x256 table indexed gray*256 + blur
+        g = np.arange(256, dtype=np.float32)[:, None] / 255.0
+        b = np.arange(256, dtype=np.float32)[None, :] / 255.0
+        self.pencil_lut = (np.clip(g / np.maximum(1.0 - b, 1e-3), 0, 1) ** 1.6).astype(np.float32).ravel()
+        self._local = threading.local()  # a CLAHE object keeps scratch buffers: one per thread
+
+    @property
+    def clahe(self):
+        c = getattr(self._local, "clahe", None)
+        if c is None:
+            c = self._local.clahe = cv2.createCLAHE(2.0, (8, 8))
+        return c
 
     def _hatch(self, angle, spacing, seed):
         r = np.random.default_rng(seed)
@@ -39,29 +54,41 @@ class Sketcher:
         return img[H // 2:H // 2 + H, W // 2:W // 2 + W]
 
     def __call__(self, bgr, t=0.0):
+        # Every factor below is in [0, 1], multiplied together in place into `out`;
+        # in-place float32 math keeps this fast (numpy temporaries dominated the time).
         gray = self.clahe.apply(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
-        g = gray.astype(np.float32) / 255.0
-        # pencil: colour-dodge of gray with its blurred inverse
-        blur = cv2.GaussianBlur(255 - gray, (0, 0), 6).astype(np.float32) / 255.0
-        pencil = np.clip(g / np.maximum(1.0 - blur, 1e-3), 0, 1) ** 1.6
-        # ink outlines
+        # pencil: table lookup on (gray, blurred inverse of gray)
+        idx = gray.astype(np.int32)
+        idx <<= 8
+        idx += cv2.GaussianBlur(255 - gray, (0, 0), 6)
+        out = self.pencil_lut.take(idx)
+        # ink outlines: 1 - 0.85 * soft edges
         edges = cv2.Canny(cv2.bilateralFilter(gray, 7, 50, 7), 40, 110)
         edges = cv2.dilate(edges, np.ones((2, 2), np.uint8))
-        ink = 1.0 - cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (0, 0), 0.7) * 0.85
-        # cross-hatching in the shadows
-        tone = cv2.GaussianBlur(g, (0, 0), 3)
-        shade = np.ones_like(g)
-        for tex, thr in self.hatches:
-            mask = np.clip((thr - tone) / 0.12, 0, 1)
-            shade = np.minimum(shade, 1.0 - mask * (1.0 - tex) * 0.75)
-        out = pencil * ink * shade * self.paper
+        ink = cv2.GaussianBlur(edges.astype(np.float32), (0, 0), 0.7)
+        ink *= np.float32(-0.85 / 255.0)
+        ink += 1.0
+        out *= ink
+        # cross-hatching in the shadows: each layer fades in below its tone threshold
+        tone = cv2.GaussianBlur(gray.astype(np.float32) * np.float32(1 / 255.0), (0, 0), 3)
+        dark = np.zeros_like(tone)
+        layer = np.empty_like(tone)
+        for weight, thr in self.hatch_dark:
+            np.multiply(tone, np.float32(-1 / 0.12), out=layer)  # (thr - tone) / 0.12
+            layer += np.float32(thr / 0.12)
+            np.clip(layer, 0, 1, out=layer)
+            layer *= weight
+            np.maximum(dark, layer, out=dark)
+        np.subtract(1.0, dark, out=dark)
+        out *= dark
+        out *= self.paper
         # slight hand wobble that drifts slowly over time
         k = math.sin(t * 0.7) * 0.6
         M = np.float32([[1, 0.004 * k, 0], [0.003 * k, 1, 0]])
         out = cv2.warpAffine(out, M, (self.w, self.h), borderMode=cv2.BORDER_REFLECT)
-        # warm paper tint (BGR)
-        tinted = np.dstack([out * 0.93 + 0.04, out * 0.96 + 0.025, out])
-        return (np.clip(tinted, 0, 1) * 255).astype(np.uint8)
+        # warm paper tint (BGR): scale each channel straight to uint8
+        return cv2.merge([(out * np.float32(255 * a) + np.float32(255 * b)).astype(np.uint8)
+                          for a, b in ((0.93, 0.04), (0.96, 0.025), (1.0, 0.0))])
 
 
 def contact_sheet(thumbs, title, cols=6, scale=1 / 3):

@@ -15,10 +15,13 @@ video's title in lowercase-with-dashes (tags like "(Official Video)" dropped):
 """
 import argparse
 import json
+import os
 import re
 import sys
 import time
 import unicodedata
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -85,7 +88,11 @@ def main(argv=None):
     p.add_argument("--min-shot", type=float, default=0.25, help="ignore shots shorter than this many seconds (default 0.25)")
     p.add_argument("--cols", type=int, default=6, help="contact sheet columns (default 6)")
     p.add_argument("--crf", type=int, default=24, help="x264 quality, lower = bigger/better (default 24)")
+    p.add_argument("--preset", default="slow",
+                   help="x264 speed preset, e.g. medium, fast, veryfast: faster files are a little bigger (default slow)")
     p.add_argument("--no-video", action="store_true", help="only make frames + contact sheet (much faster)")
+    p.add_argument("--workers", type=int, default=0,
+                   help="frames sketched in parallel (default: CPU threads, at most 12; 1 = serial)")
     a = p.parse_args(argv)
     # Don't crash printing non-ASCII titles to a legacy console / redirected output.
     for stream in (sys.stdout, sys.stderr):
@@ -124,12 +131,31 @@ def main(argv=None):
     picks = shot_frames(cuts, duration, fps, a.min_shot)
     print(f"  {len(cuts)} cuts -> {len(picks)} shots")
 
+    workers = max(1, a.workers or min(12, os.cpu_count() or 1))
+    if workers > 1:
+        # parallelism comes from sketching whole frames side by side; OpenCV's own
+        # per-call threads on top of that only oversubscribe the cores
+        cv2.setNumThreads(1)
     sketch = Sketcher(W, H)
     video_out = a.out / f"{slug}_scribble.mp4"
     thumbs = []
     start = time.time()
+
+    def finish(t, shot, s):
+        if encoder:
+            encoder.write(s)
+        if shot:
+            name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
+            save_png(frames_dir / name, s)
+            thumbs.append((t, s))
+
     with (nullcontext() if a.no_video
-          else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf)) as encoder:
+          else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
+                                preset=a.preset)) as encoder, \
+            ThreadPoolExecutor(workers) as pool:
+        # frames are sketched out of order on the pool and written back in order;
+        # `pending` caps how many decoded frames are held in memory at once
+        pending = deque()
         i = 0
         while True:
             ok, frame = cap.read()
@@ -138,17 +164,19 @@ def main(argv=None):
             t = i / fps
             shot = picks.get(i)
             if encoder or shot:
-                s = sketch(frame, t)
-                if encoder:
-                    encoder.write(s)
-                if shot:
-                    name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
-                    save_png(frames_dir / name, s)
-                    thumbs.append((t, s))
+                pending.append((t, shot, pool.submit(sketch, frame, t)))
+                if len(pending) > 2 * workers:
+                    t0, shot0, fut = pending.popleft()
+                    finish(t0, shot0, fut.result())
             i += 1
             if i % 300 == 0:
                 print(f"\r  rendering {i}/{total} ({time.time() - start:.0f}s)", end="", flush=True)
-        print(f"\r  read {i} frames in {time.time() - start:.0f}s" + ("" if a.no_video else "; finishing encode..."))
+        while pending:
+            t0, shot0, fut = pending.popleft()
+            finish(t0, shot0, fut.result())
+        elapsed = time.time() - start
+        print(f"\r  read {i} frames in {elapsed:.0f}s ({i / max(elapsed, 1e-9):.0f} fps, {workers} threads)"
+              + ("" if a.no_video else "; finishing encode..."))
     cap.release()
 
     save_png(a.out / "contact_sheet.png", contact_sheet(thumbs, title, cols=a.cols))
