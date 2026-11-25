@@ -1,0 +1,65 @@
+# Builds the package and, when a GitHub release is published, uploads it to PyPI.
+#
+# Publishing uses PyPI trusted publishing: PyPI trusts this workflow file in this repo,
+# so no API token is stored anywhere. See "Releasing" in README.md for the one-time setup.
+#
+# Run it by hand (Actions tab > release > Run workflow) to check that the package
+# builds and installs, without publishing anything.
+
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Check the release tag matches the version in pyproject.toml
+        if: github.event_name == 'release'
+        run: |
+          version="$(uv version --short)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Release tag is ${GITHUB_REF_NAME} but pyproject.toml says ${version}; the tag should be v${version}."
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Install the built wheel and run it
+        run: uv run --isolated --no-project --with dist/*.whl scribble --help
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/scribble-video/
+    permissions:
+      id-token: write  # lets PyPI verify this workflow (trusted publishing)
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always

@@ -9,7 +9,7 @@ requires-python = ">=3.10"
 dependencies = [
     "imageio-ffmpeg",
     "numpy",
-    "opencv-python",
+    "opencv-python-headless",
     "yt-dlp",
 ]
 
