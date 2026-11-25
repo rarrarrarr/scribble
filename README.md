@@ -103,7 +103,7 @@ gh release create "v$(uv version --short)" --generate-notes
 
 The release tag must be `v` plus the version in `pyproject.toml`, or the workflow stops before publishing. To check that the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
 
-PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. This takes a one-time setup:
+PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. Each upload also carries a signed [attestation](https://docs.pypi.org/attestations/), shown under "Verified details" on PyPI, that ties the files to the GitHub repo, workflow and commit that built them. This takes a one-time setup:
 
 1. On PyPI, open [Publishing](https://pypi.org/manage/account/publishing/) and add a pending publisher for GitHub: project `scribble-video`, owner `rarrarrarr`, repository `scribble`, workflow `release.yml`, environment `pypi`. The first release then creates the project.
 2. On GitHub, under Settings > Environments, create an environment named `pypi`. Optionally add yourself as a required reviewer, so every upload waits for your approval.
