@@ -17,7 +17,7 @@ def ffmpeg_exe():
         exe = shutil.which("ffmpeg")
         if exe:
             return exe
-        raise SystemExit("ffmpeg not found: pip install imageio-ffmpeg, or install ffmpeg on PATH")
+        raise SystemExit("ffmpeg not found: run `uv sync`, or install ffmpeg on PATH")
 
 
 def _probe(video):

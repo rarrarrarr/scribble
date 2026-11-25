@@ -20,7 +20,7 @@ def download(url, dest_dir, max_height=1080):
     try:
         import yt_dlp
     except ImportError:
-        raise SystemExit("yt-dlp is needed for links: python -m pip install -U yt-dlp")
+        raise SystemExit("yt-dlp is needed for links: uv lock --upgrade-package yt-dlp")
 
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)

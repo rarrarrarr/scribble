@@ -1,7 +1,7 @@
 """One command: video -> scribbled shot frames + contact sheet + sketch video with audio.
 
 usage:
-    python scripts/make_scribble.py VIDEO_OR_LINK [-o OUTDIR] [options]
+    uv run scribble VIDEO_OR_LINK [-o OUTDIR] [options]
 
 A link (e.g. https://www.youtube.com/watch?v=...) is downloaded with yt-dlp into
 ./source first ('<title> [<id>].mkv' + .info.json); later runs reuse that file.

@@ -6,24 +6,25 @@ Turn a video (or a YouTube link) into a pencil-and-ink sketch: one drawing per s
 
 ## Requirements
 
-- Python 3.10+
-- PowerShell 7+ for the `scribble.ps1` launcher (Windows, macOS or Linux), or call the Python script directly
+- [uv](https://docs.astral.sh/uv/) (Windows, macOS or Linux), which also fetches Python 3.10+ if you don't have it
+
+Dependencies go in a virtual environment inside this repo (`.venv`), not your global Python. `uv run` creates it on first use; to set it up ahead of time:
 
 ```shell
-python -m pip install -r requirements.txt
+uv sync
 ```
 
-This installs OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
+This installs the versions pinned in `uv.lock`: OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
 
 ## Usage
 
-```powershell
-./scribble.ps1 "https://www.youtube.com/watch?v=aqz-KE-bpKQ"   # a link: downloaded first
-./scribble.ps1 path/to/video.mp4                                # a local file
-./scribble.ps1 path/to/video.mp4 --no-video                     # just the drawings, much faster
+```shell
+uv run scribble "https://www.youtube.com/watch?v=aqz-KE-bpKQ"   # a link: downloaded first
+uv run scribble path/to/video.mp4                                # a local file
+uv run scribble path/to/video.mp4 --no-video                     # just the drawings, much faster
 ```
 
-Quote links in PowerShell, since `&` is special there. Without PowerShell, run `python scripts/make_scribble.py ...` with the same arguments.
+Run it from the repo folder; output and downloads go in the current folder. Quote links, since `&` is special to most shells.
 
 Each video gets its own folder, named after its title:
 
@@ -58,12 +59,12 @@ Each run replaces that folder's previous drawings.
 
 ## Troubleshooting
 
-- **Downloads fail:** YouTube changes often and older yt-dlp versions stop working. Update it with `python -m pip install -U yt-dlp`.
+- **Downloads fail:** YouTube changes often and older yt-dlp versions stop working. Update it with `uv lock --upgrade-package yt-dlp`; the next run installs the new version.
 - **yt-dlp warns about a JavaScript runtime:** install [deno](https://deno.com) to silence it and make more formats available.
 
 ## Code layout
 
-- `scripts/make_scribble.py`: the command; runs each step in order
+- `scripts/make_scribble.py`: the `scribble` command; runs each step in order
 - `scripts/scribble.py`: the sketch look and the contact sheet layout; edit this to change the style
 - `scripts/ffmpeg_tools.py`: scene detection and video encoding
 - `scripts/download.py`: downloading links with yt-dlp
