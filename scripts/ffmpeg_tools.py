@@ -43,14 +43,38 @@ def detect_cuts(video, threshold=0.3):
     return [float(t) for t in re.findall(r"pts_time:([0-9.]+)", r.stderr)]
 
 
+@lru_cache(maxsize=None)
+def nvenc_works():
+    """True if ffmpeg can open NVIDIA's H.264 encoder here (needs an NVIDIA GPU and a
+    recent enough driver; ffmpeg lists the encoder even when it cannot use it)."""
+    cmd = [ffmpeg_exe(), "-v", "error", "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+           "-c:v", "h264_nvenc", "-f", "null", "-"]
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def pick_encoder(choice):
+    """'auto' -> 'nvenc' when it works, else 'x264'; an explicit choice is checked."""
+    if choice == "auto":
+        return "nvenc" if nvenc_works() else "x264"
+    if choice == "nvenc" and not nvenc_works():
+        raise SystemExit("--encoder nvenc: ffmpeg could not open the NVIDIA encoder "
+                         "(needs an NVIDIA GPU and an up-to-date driver)")
+    return choice
+
+
 class VideoEncoder:
     """Pipe raw BGR frames into ffmpeg (H.264), optionally taking audio from another file.
 
+    encoder is 'x264' (CPU; crf and preset apply) or 'nvenc' (NVIDIA GPU; crf maps
+    to about the same quality as x264's slow preset, and preset is ignored).
     Audio is stream-copied when the codec fits in the container, otherwise encoded to AAC.
     Use as a context manager, calling write(frame) for each frame.
     """
 
-    def __init__(self, out, width, height, fps, audio_from=None, crf=24, preset="slow"):
+    def __init__(self, out, width, height, fps, audio_from=None, crf=24, preset="slow", encoder="x264"):
         cmd = [ffmpeg_exe(), "-v", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
                "-framerate", f"{fps:.6f}", "-i", "-"]
@@ -59,8 +83,14 @@ class VideoEncoder:
             copy = codec in MP4_SAFE_AUDIO or not str(out).lower().endswith((".mp4", ".m4v", ".mov"))
             cmd += ["-i", str(audio_from), "-map", "0:v", "-map", "1:a:0", "-shortest"]
             cmd += ["-c:a", "copy"] if copy else ["-c:a", "aac", "-b:a", "256k"]
-        cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-                "-pix_fmt", "yuv420p", str(out)]
+        if encoder == "nvenc":
+            # NVENC's -cq 21 measured the same size and PSNR as x264 -crf 24 -preset slow
+            # on sketch frames, so offset it to keep --crf meaning one quality on both
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+                    "-rc", "vbr", "-cq", str(max(crf - 3, 0)), "-b:v", "0"]
+        else:
+            cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+        cmd += ["-pix_fmt", "yuv420p", str(out)]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def write(self, frame):

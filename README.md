@@ -46,6 +46,7 @@ Links are downloaded into `source/`, and running again reuses that file.
 | `--threshold N` | `0.3` | scene-change sensitivity, 0 to 1; lower finds more shots |
 | `--min-shot SECONDS` | `0.25` | ignore shots shorter than this |
 | `--crf N` | `24` | video quality; lower is better and bigger |
+| `--encoder NAME` | `auto` | `nvenc` encodes on an NVIDIA GPU (needs a recent driver), `x264` on the CPU; `auto` uses the GPU when it works |
 | `--preset NAME` | `slow` | x264 speed preset; `veryfast` renders about 20% sooner |
 | `--workers N` | CPU threads, at most 12 | frames sketched in parallel; `1` for one at a time |
 | `--cols N` | `6` | contact sheet columns |

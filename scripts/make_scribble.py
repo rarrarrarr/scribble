@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cv2  # noqa: E402
 
 from download import download, is_url  # noqa: E402
-from ffmpeg_tools import VideoEncoder, detect_cuts  # noqa: E402
+from ffmpeg_tools import VideoEncoder, detect_cuts, pick_encoder  # noqa: E402
 from scribble import Sketcher, contact_sheet, fmt_time  # noqa: E402
 
 
@@ -87,7 +87,9 @@ def main(argv=None):
     p.add_argument("--threshold", type=float, default=0.3, help="scene-change sensitivity 0-1; lower = more shots (default 0.3)")
     p.add_argument("--min-shot", type=float, default=0.25, help="ignore shots shorter than this many seconds (default 0.25)")
     p.add_argument("--cols", type=int, default=6, help="contact sheet columns (default 6)")
-    p.add_argument("--crf", type=int, default=24, help="x264 quality, lower = bigger/better (default 24)")
+    p.add_argument("--crf", type=int, default=24, help="video quality, lower = bigger/better (default 24)")
+    p.add_argument("--encoder", choices=("auto", "nvenc", "x264"), default="auto",
+                   help="nvenc = NVIDIA GPU, x264 = CPU; auto uses the GPU when it works (default auto)")
     p.add_argument("--preset", default="slow",
                    help="x264 speed preset, e.g. medium, fast, veryfast: faster files are a little bigger (default slow)")
     p.add_argument("--no-video", action="store_true", help="only make frames + contact sheet (much faster)")
@@ -138,6 +140,9 @@ def main(argv=None):
         cv2.setNumThreads(1)
     sketch = Sketcher(W, H)
     video_out = a.out / f"{slug}_scribble.mp4"
+    if not a.no_video:
+        a.encoder = pick_encoder(a.encoder)
+        print(f"rendering with {workers} threads, encoding with {a.encoder}")
     thumbs = []
     start = time.time()
 
@@ -151,7 +156,7 @@ def main(argv=None):
 
     with (nullcontext() if a.no_video
           else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
-                                preset=a.preset)) as encoder, \
+                                preset=a.preset, encoder=a.encoder)) as encoder, \
             ThreadPoolExecutor(workers) as pool:
         # frames are sketched out of order on the pool and written back in order;
         # `pending` caps how many decoded frames are held in memory at once
