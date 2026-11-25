@@ -1,8 +1,7 @@
 __pycache__/
 .venv/
-*.egg-info/
 
 # generated / downloaded media (large, and copies of copyrighted videos)
-source/
-audio/
-scribble/
+/source/
+/audio/
+/scribble/

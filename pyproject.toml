@@ -1,9 +1,10 @@
 [project]
-name = "scribble"
+name = "scribble-video"
 version = "0.1.0"
 description = "Turn a video (or a YouTube link) into a pencil-and-ink sketch"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "imageio-ffmpeg",
@@ -13,13 +14,16 @@ dependencies = [
 ]
 
 [project.scripts]
-scribble = "make_scribble:main"
+scribble = "scribble.cli:main"
+
+[project.urls]
+Repository = "https://github.com/rarrarrarr/scribble"
+Issues = "https://github.com/rarrarrarr/scribble/issues"
 
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
 
-# The modules live flat in scripts/; uv installs them editable, so edits apply right away.
-[tool.setuptools]
-package-dir = { "" = "scripts" }
-py-modules = ["make_scribble", "scribble", "ffmpeg_tools", "download"]
+# The package is src/scribble; without this, uv_build would look for src/scribble_video.
+[tool.uv.build-backend]
+module-name = "scribble"

@@ -1,6 +1,6 @@
 """The 'scribble' look: pencil shading + ink outlines + cross-hatching on paper.
 
-Pure image code (OpenCV/numpy), no I/O. Used by make_scribble.py.
+Pure image code (OpenCV/numpy), no I/O. Used by cli.py.
 """
 import math
 import threading

@@ -1,8 +1,8 @@
-"""Download a video (e.g. a YouTube link) with yt-dlp for make_scribble.py."""
+"""Download a video (e.g. a YouTube link) with yt-dlp."""
 import re
 from pathlib import Path
 
-from ffmpeg_tools import ffmpeg_exe
+from .ffmpeg_tools import ffmpeg_exe
 
 URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
 

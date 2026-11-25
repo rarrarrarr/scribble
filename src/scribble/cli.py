@@ -1,13 +1,18 @@
 """One command: video -> scribbled shot frames + contact sheet + sketch video with audio.
 
 usage:
-    uv run scribble VIDEO_OR_LINK [-o OUTDIR] [options]
+    scribble VIDEO_OR_LINK [-o OUTDIR] [options]      (installed as a tool)
+    uv run scribble VIDEO_OR_LINK ...                 (from a clone of the repo)
+
+Where files go: run from the repo (`uv run scribble`), into the repo's scribble/
+and source/ folders; installed as a tool, into ~/scribble/. Set SCRIBBLE_HOME to
+use another folder instead (outputs in it, downloads in its source/ subfolder).
 
 A link (e.g. https://www.youtube.com/watch?v=...) is downloaded with yt-dlp into
-./source first ('<title> [<id>].mkv' + .info.json); later runs reuse that file.
+the source folder first ('<title> [<id>].mkv' + .info.json); later runs reuse that file.
 
-Each video gets its own OUTDIR, default ./scribble/<slug>, where <slug> is the
-video's title in lowercase-with-dashes (tags like "(Official Video)" dropped):
+Each video gets its own OUTDIR, named <slug>: the video's title in
+lowercase-with-dashes (tags like "(Official Video)" dropped):
     frames/frame_NNN_<m>m<ss.ss>s.png   one sketch per shot (middle of the shot)
     contact_sheet.png                   all shot sketches on one page
     <slug>_scribble.mp4                 the whole video in sketch style, original audio
@@ -25,14 +30,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 
-# Sibling modules live next to this file; add it explicitly so `python -I` works too.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cv2
 
-import cv2  # noqa: E402
-
-from download import download, is_url  # noqa: E402
-from ffmpeg_tools import VideoEncoder, detect_cuts, pick_encoder  # noqa: E402
-from scribble import Sketcher, contact_sheet, fmt_time  # noqa: E402
+from .download import download, is_url
+from .ffmpeg_tools import VideoEncoder, detect_cuts, pick_encoder
+from .sketch import Sketcher, contact_sheet, fmt_time
 
 
 def guess_title(video):
@@ -60,6 +62,24 @@ def slugify(title, max_len=60):
     return s  # may be "" for e.g. all-CJK titles; caller falls back
 
 
+def default_dirs():
+    """(output root, download dir) when -o / --download-dir aren't given.
+
+    SCRIBBLE_HOME wins. Otherwise, running from this repo's own venv (`uv run scribble`)
+    writes into the repo, whatever the current folder; an installed tool (`uv tool
+    install`, which gets its own venv) writes into ~/scribble.
+    """
+    home = os.environ.get("SCRIBBLE_HOME")
+    if home:
+        home = Path(home).expanduser()
+        return home, home / "source"
+    repo = Path(__file__).resolve().parents[2]  # <repo>/src/scribble/cli.py
+    if (repo / "pyproject.toml").is_file() and repo in Path(sys.prefix).resolve().parents:
+        return repo / "scribble", repo / "source"
+    home = Path.home() / "scribble"
+    return home, home / "source"
+
+
 def save_png(path, img):
     # cv2.imwrite silently fails on non-ASCII paths on Windows; encode in memory instead.
     ok, buf = cv2.imencode(".png", img)
@@ -76,12 +96,12 @@ def shot_frames(cuts, duration, fps, min_shot):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(prog="scribble", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("video", help="video file, or a link (e.g. YouTube) to download first")
     p.add_argument("-o", "--out", type=Path,
-                   help="output folder for this video (default: ./scribble/<slug of title>)")
-    p.add_argument("--download-dir", type=Path, default=Path("source"),
-                   help="where links are downloaded to (default: ./source); re-runs reuse the file")
+                   help="output folder for this video (default: <output root>/<slug of title>, see above)")
+    p.add_argument("--download-dir", type=Path,
+                   help="where links are downloaded to (default: the source folder, see above); re-runs reuse the file")
     p.add_argument("--max-height", type=int, default=1080, help="max video height to download (default 1080)")
     p.add_argument("--title", help="contact sheet title (default: from .info.json or file name)")
     p.add_argument("--threshold", type=float, default=0.3, help="scene-change sensitivity 0-1; lower = more shots (default 0.3)")
@@ -96,6 +116,8 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=0,
                    help="frames sketched in parallel (default: CPU threads, at most 12; 1 = serial)")
     a = p.parse_args(argv)
+    out_root, download_dir = default_dirs()
+    a.download_dir = a.download_dir or download_dir
     # Don't crash printing non-ASCII titles to a legacy console / redirected output.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -112,7 +134,7 @@ def main(argv=None):
     title = a.title or guess_title(a.video)
     # downloaded files are '<title> [<id>]', so a non-Latin title still yields the video id
     slug = slugify(title) or slugify(a.video.stem) or "video"
-    a.out = a.out or Path("scribble") / slug
+    a.out = a.out or out_root / slug
     frames_dir = a.out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     for old in frames_dir.glob("frame_*.png"):  # stale shots from an earlier run
@@ -188,6 +210,3 @@ def main(argv=None):
     print(f"done -> {a.out.resolve()}")
     print(f"  {len(thumbs)} frames, contact_sheet.png" + ("" if a.no_video else f", {video_out.name}"))
 
-
-if __name__ == "__main__":
-    main()
