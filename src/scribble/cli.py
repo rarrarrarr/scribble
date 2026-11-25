@@ -28,6 +28,7 @@ import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import cv2
@@ -97,6 +98,11 @@ def shot_frames(cuts, duration, fps, min_shot):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="scribble", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    try:
+        ver = version("scribble-video")  # from pyproject.toml, via the installed package's metadata
+    except PackageNotFoundError:
+        ver = "unknown"
+    p.add_argument("-v", "--version", action="version", version=f"%(prog)s {ver}")
     p.add_argument("video", help="video file, or a link (e.g. YouTube) to download first")
     p.add_argument("-o", "--out", type=Path,
                    help="output folder for this video (default: <output root>/<slug of title>, see above)")

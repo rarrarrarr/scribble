@@ -14,7 +14,7 @@ uv tool install git+https://github.com/rarrarrarr/scribble
 
 This puts a `scribble` command on your PATH. It has its own isolated environment, so nothing is installed into your global Python, and the repo isn't needed afterwards. The dependencies are OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
 
-Upgrade with `uv tool upgrade scribble-video`, and remove it with `uv tool uninstall scribble-video`. The package is named `scribble-video` because `scribble` on PyPI is an unrelated project; the command is still `scribble`.
+Upgrade with `uv tool upgrade scribble-video` (`scribble --version` shows what you have), and remove it with `uv tool uninstall scribble-video`. The package is named `scribble-video` because `scribble` on PyPI is an unrelated project; the command is still `scribble`.
 
 ## Usage
 
@@ -103,10 +103,7 @@ gh release create "v$(uv version --short)" --generate-notes
 
 The release tag must be `v` plus the version in `pyproject.toml`, or the workflow stops before publishing. To check that the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
 
-PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. Each upload also carries a signed [attestation](https://docs.pypi.org/attestations/), shown under "Verified details" on PyPI, that ties the files to the GitHub repo, workflow and commit that built them. This takes a one-time setup:
-
-1. On PyPI, open [Publishing](https://pypi.org/manage/account/publishing/) and add a pending publisher for GitHub: project `scribble-video`, owner `rarrarrarr`, repository `scribble`, workflow `release.yml`, environment `pypi`. The first release then creates the project.
-2. On GitHub, under Settings > Environments, create an environment named `pypi`. Optionally add yourself as a required reviewer, so every upload waits for your approval.
+PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. Each upload also carries a signed [attestation](https://docs.pypi.org/attestations/), shown under "Verified details" on PyPI, that ties the files to the GitHub repo, workflow and commit that built them.
 
 ## Use responsibly
 
