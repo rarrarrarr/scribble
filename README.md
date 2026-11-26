@@ -16,13 +16,15 @@ This puts a `scribble` command on your PATH. The package is named `scribble-vide
 
 ### Faster on an NVIDIA GPU (optional)
 
-With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about twice as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. To install scribble with GPU support, use this instead of the command above:
+With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about three times as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. To install scribble with GPU support, use this instead of the command above:
 
 ```shell
 uv tool install "scribble-video[gpu]"
 ```
 
 The quotes stop the shell from treating `[gpu]` as a pattern. If you already installed scribble without it, the same command adds the GPU support. You need a recent NVIDIA driver (version 525 or newer). You don't need the CUDA toolkit. scribble then uses the GPU automatically (`--device auto`), says `sketching on the GPU` when it does, and falls back to the CPU if the GPU can't be used.
+
+Decoding the video doesn't need the extra: ffmpeg decodes on any GPU it can use (NVIDIA, AMD, Intel or Apple), and on the CPU otherwise.
 
 ### What gets installed, upgrading and removing
 
@@ -112,7 +114,7 @@ All in `src/scribble/`:
 - `cli.py`: the `scribble` command; runs each step in order
 - `sketch.py`: the sketch look and the contact sheet layout; edit this to change the style
 - `gpu_sketch.py`: the same look with most of the work on an NVIDIA GPU (CuPy); a style change in `sketch.py` needs the same change here
-- `ffmpeg_tools.py`: scene detection and video encoding
+- `ffmpeg_tools.py`: scene detection, and decoding and encoding the video
 - `download.py`: downloading links with yt-dlp
 
 ## Releasing

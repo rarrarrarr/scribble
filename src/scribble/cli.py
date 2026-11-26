@@ -34,7 +34,7 @@ from pathlib import Path
 import cv2
 
 from .download import download, is_url
-from .ffmpeg_tools import VideoEncoder, detect_cuts, pick_encoder
+from .ffmpeg_tools import VideoDecoder, VideoEncoder, detect_cuts, pick_decoder, pick_encoder
 from .sketch import Sketcher, contact_sheet, fmt_time
 
 
@@ -164,17 +164,22 @@ def main(argv=None):
     for old in frames_dir.glob("frame_*.png"):  # stale shots from an earlier run
         old.unlink()
 
+    # OpenCV only reads the frame rate and count here; ffmpeg decodes the frames
     cap = cv2.VideoCapture(str(a.video))
     if not cap.isOpened():
         sys.exit(f"OpenCV could not open {a.video}")
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    try:
+        hwaccel, decoder, W, H = pick_decoder(a.video)
+    except RuntimeError as e:
+        sys.exit(str(e))
     duration = total / fps
     print(f"{a.video.name}: {W}x{H} @ {fps:.3f} fps, {fmt_time(duration)}")
 
     print("detecting scene cuts...")
-    cuts = detect_cuts(a.video, a.threshold)
+    cuts = detect_cuts(a.video, a.threshold, hwaccel)
     (a.out / "cuts.txt").write_text("\n".join(f"{c:.3f}" for c in cuts) + "\n")
     picks = shot_frames(cuts, duration, fps, a.min_shot)
     print(f"  {len(cuts)} cuts -> {len(picks)} shots")
@@ -186,11 +191,13 @@ def main(argv=None):
         cv2.setNumThreads(1)
     sketch, device = make_sketcher(a.device, W, H)
     video_out = a.out / f"{slug}_scribble.mp4"
+    # ffmpeg still decodes on the CPU if the GPU can't handle this codec, so name the option
+    decoding = f"decoding with ffmpeg -hwaccel {decoder}" if decoder != "cpu" else "decoding on the CPU"
     if a.no_video:
-        print(f"sketching shots on the {device.upper()}")
+        print(f"{decoding}, sketching shots on the {device.upper()}")
     else:
         a.encoder = pick_encoder(a.encoder)
-        print(f"sketching on the {device.upper()} with {workers} threads, encoding with {a.encoder}")
+        print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, encoding with {a.encoder}")
     thumbs = []
     start = time.time()
 
@@ -205,15 +212,13 @@ def main(argv=None):
     with (nullcontext() if a.no_video
           else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
                                 preset=a.preset, encoder=a.encoder)) as encoder, \
+            VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
             ThreadPoolExecutor(workers) as pool:
         # frames are sketched out of order on the pool and written back in order;
         # `pending` caps how many decoded frames are held in memory at once
         pending = deque()
         i = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for frame in frames:
             t = i / fps
             shot = picks.get(i)
             if encoder or shot:
@@ -230,7 +235,6 @@ def main(argv=None):
         elapsed = time.time() - start
         print(f"\r  read {i} frames in {elapsed:.0f}s ({i / max(elapsed, 1e-9):.0f} fps, {workers} threads)"
               + ("" if a.no_video else "; finishing encode..."))
-    cap.release()
 
     save_png(a.out / "contact_sheet.png", contact_sheet(thumbs, title, cols=a.cols))
     print(f"done -> {a.out.resolve()}")

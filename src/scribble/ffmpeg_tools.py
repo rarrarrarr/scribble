@@ -1,8 +1,13 @@
 """Thin helpers around the ffmpeg binary (bundled by imageio-ffmpeg, or found on PATH)."""
+import queue
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 from functools import lru_cache
+
+import numpy as np
 
 # Audio codecs that can be stream-copied into an .mp4 without re-encoding.
 MP4_SAFE_AUDIO = {"aac", "mp3", "opus", "flac", "alac", "ac3", "eac3"}
@@ -33,9 +38,91 @@ def audio_codec(video):
     return m.group(1) if m else None
 
 
-def detect_cuts(video, threshold=0.3):
-    """Timestamps (seconds) where ffmpeg's scene-change score exceeds `threshold`."""
-    cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", "-i", str(video), "-an",
+@lru_cache(maxsize=None)
+def pick_decoder(video):
+    """(ffmpeg input options, label, width, height) for decoding `video`.
+
+    Tries NVIDIA's decoder, then whatever GPU decoder ffmpeg finds on its own (AMD and
+    Intel on Windows, VideoToolbox on macOS, VAAPI on Linux), then the CPU. Even with a
+    GPU decoder picked, ffmpeg decodes on the CPU any codec that decoder can't handle,
+    so the label says what was asked for, not what ran. Width and height come from
+    ffmpeg itself, so they match the frames it outputs (after rotation).
+    """
+    for hw in (["-hwaccel", "cuda"], ["-hwaccel", "auto"], []):
+        cmd = [ffmpeg_exe(), "-hide_banner", "-nostdin", "-v", "verbose", *hw, "-i", str(video),
+               "-an", "-sn", "-frames:v", "3", "-f", "null", "-"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        out = r.stderr.partition("Output #0")[2]
+        size = re.search(r"Video: .*?[ ,](\d{2,5})x(\d{2,5})[ ,\n]", out)
+        if r.returncode != 0 or not size:
+            continue
+        if hw == ["-hwaccel", "auto"]:
+            # 'auto' quietly decodes on the CPU when it finds no GPU decoder: report that
+            m = re.search(r"Using auto hwaccel type (\w+)", r.stderr)
+            if not m:
+                continue
+            hw = ["-hwaccel", m.group(1)]
+        return hw, (hw[1] if hw else "cpu"), int(size.group(1)), int(size.group(2))
+    raise RuntimeError(f"ffmpeg could not decode {video}:\n{r.stderr[-2000:]}")
+
+
+class VideoDecoder:
+    """Iterate over a video's frames as uint8 arrays: (height, width, 3) BGR, or
+    (height, width) with gray=True.
+
+    ffmpeg decodes (with `hwaccel`, the options from pick_decoder) and a background
+    thread reads its output, so decoding overlaps whatever the caller does with each
+    frame. Every decoded frame is returned once, like OpenCV's VideoCapture. Gray is
+    a third of the data and skips ffmpeg's colour conversion; it matches OpenCV's
+    BGR-to-gray of ffmpeg's BGR to within one level. Use as a context manager.
+    """
+
+    def __init__(self, video, width, height, hwaccel=(), gray=False):
+        cmd = [ffmpeg_exe(), "-v", "error", "-nostdin", *hwaccel, "-i", str(video), "-an", "-sn",
+               "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray" if gray else "bgr24", "-"]
+        self.shape = (height, width) if gray else (height, width, 3)
+        self._err = tempfile.TemporaryFile()  # a stderr pipe nobody reads could fill and stall ffmpeg
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=self._err)
+        self._frames = queue.Queue(maxsize=8)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        size = int(np.prod(self.shape))
+        try:
+            while True:
+                # one frame per read: much faster through a Windows pipe than big reads
+                buf = self.proc.stdout.read(size)
+                if len(buf) < size:
+                    break
+                self._frames.put(np.frombuffer(buf, np.uint8).reshape(self.shape))
+        finally:
+            self._frames.put(None)
+
+    def __iter__(self):
+        while (frame := self._frames.get()) is not None:
+            yield frame
+        if self.proc.wait() != 0:
+            self._err.seek(0)
+            msg = self._err.read().decode(errors="replace")[-2000:]
+            raise RuntimeError(f"ffmpeg decoder exited with code {self.proc.returncode}:\n{msg}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.proc.poll() is None:  # stopped early: don't leave ffmpeg running
+            self.proc.kill()
+        self.proc.wait()
+        self._err.close()
+
+
+def detect_cuts(video, threshold=0.3, hwaccel=()):
+    """Timestamps (seconds) where ffmpeg's scene-change score exceeds `threshold`.
+    `hwaccel` (from pick_decoder) decodes on the GPU; the cuts found are the same."""
+    cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", *hwaccel, "-i", str(video), "-an",
            "-vf", f"select='gt(scene,{threshold})',showinfo", "-f", "null", "-"]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
@@ -71,7 +158,8 @@ class VideoEncoder:
     encoder is 'x264' (CPU; crf and preset apply) or 'nvenc' (NVIDIA GPU; crf maps
     to about the same quality as x264's slow preset, and preset is ignored).
     Audio is stream-copied when the codec fits in the container, otherwise encoded to AAC.
-    Use as a context manager, calling write(frame) for each frame.
+    Use as a context manager, calling write(frame) for each frame. Frames are piped to
+    ffmpeg from a background thread, so write() returns before ffmpeg has taken them.
     """
 
     def __init__(self, out, width, height, fps, audio_from=None, crf=24, preset="slow", encoder="x264"):
@@ -92,15 +180,29 @@ class VideoEncoder:
             cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
         cmd += ["-pix_fmt", "yuv420p", str(out)]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self._frames = queue.Queue(maxsize=8)
+        self._error = None  # set by the writer thread if the pipe breaks
+        self._writer = threading.Thread(target=self._write_all, daemon=True)
+        self._writer.start()
+
+    def _write_all(self):
+        while (frame := self._frames.get()) is not None:
+            if self._error is None:  # after a failure, keep draining so write() never blocks
+                try:
+                    self.proc.stdin.write(np.ascontiguousarray(frame).data)
+                except (BrokenPipeError, OSError) as e:
+                    self._error = e
 
     def write(self, frame):
-        try:
-            self.proc.stdin.write(frame.tobytes())
-        except (BrokenPipeError, OSError):
+        if self._error is not None:
             self.close()  # surfaces ffmpeg's exit code
-            raise
+            raise self._error
+        self._frames.put(frame)
 
     def close(self):
+        if self._writer.is_alive():
+            self._frames.put(None)
+            self._writer.join()
         if self.proc.stdin and not self.proc.stdin.closed:
             try:
                 self.proc.stdin.close()
@@ -109,6 +211,8 @@ class VideoEncoder:
         rc = self.proc.wait()
         if rc != 0:
             raise RuntimeError(f"ffmpeg encoder exited with code {rc}")
+        if self._error is not None:
+            raise self._error
 
     def __enter__(self):
         return self
@@ -116,6 +220,7 @@ class VideoEncoder:
     def __exit__(self, exc_type, *_):
         if exc_type is None:
             self.close()
-        else:  # don't mask the original error; just stop ffmpeg
+        else:  # don't mask the original error; just stop ffmpeg and the writer
             self.proc.kill()
             self.proc.wait()
+            self._frames.put(None)

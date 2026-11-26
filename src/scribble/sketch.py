@@ -10,7 +10,7 @@ import numpy as np
 
 
 class Sketcher:
-    """Converts BGR frames of a fixed size into sketch-style BGR frames.
+    """Converts BGR (or gray) frames of a fixed size into sketch-style BGR frames.
 
     Paper grain and hatch textures are generated once per instance so a video
     doesn't "boil" from frame to frame. Safe to call from several threads at once.
@@ -53,10 +53,12 @@ class Sketcher:
         img = cv2.warpAffine(img, M, (W * 2, H * 2), borderValue=1.0)
         return img[H // 2:H // 2 + H, W // 2:W // 2 + W]
 
-    def gray_and_edges(self, bgr):
+    def gray_and_edges(self, frame):
         """Contrast-equalised gray and dilated ink edges (uint8): the steps the GPU
-        sketcher also leaves on the CPU, as CuPy has no CLAHE, bilateral or Canny."""
-        gray = self.clahe.apply(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        sketcher also leaves on the CPU, as CuPy has no CLAHE, bilateral or Canny.
+        `frame` is BGR, or already gray (2-D): the look only uses brightness."""
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = self.clahe.apply(gray)
         edges = cv2.Canny(cv2.bilateralFilter(gray, 7, 50, 7), 40, 110)
         return gray, cv2.dilate(edges, np.ones((2, 2), np.uint8))
 
@@ -69,10 +71,11 @@ class Sketcher:
     # warm paper tint (BGR): each channel is out * 255 * a + 255 * b
     TINT = ((0.93, 0.04), (0.96, 0.025), (1.0, 0.0))
 
-    def __call__(self, bgr, t=0.0):
+    def __call__(self, frame, t=0.0):
+        """Sketch of one frame (BGR or gray uint8) at time t seconds, as BGR uint8."""
         # Every factor below is in [0, 1], multiplied together in place into `out`;
         # in-place float32 math keeps this fast (numpy temporaries dominated the time).
-        gray, edges = self.gray_and_edges(bgr)
+        gray, edges = self.gray_and_edges(frame)
         # pencil: table lookup on (gray, blurred inverse of gray)
         idx = gray.astype(np.int32)
         idx <<= 8

@@ -130,8 +130,8 @@ class GpuSketcher(Sketcher):
                                       np.int32(0), np.int32(1)))
         return out
 
-    def __call__(self, bgr, t=0.0):
-        gray, edges = self.gray_and_edges(bgr)
+    def __call__(self, frame, t=0.0):
+        gray, edges = self.gray_and_edges(frame)
         stream = getattr(self._tls, "stream", None)
         if stream is None:
             stream = self._tls.stream = cp.cuda.Stream(non_blocking=True)
