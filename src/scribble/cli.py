@@ -199,6 +199,7 @@ def main(argv=None):
         a.encoder = pick_encoder(a.encoder)
         print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, encoding with {a.encoder}")
     thumbs = []
+    saves = []  # PNG writes, done off the main thread (about 30 ms each at 720p)
     start = time.time()
 
     def finish(t, shot, s):
@@ -206,14 +207,14 @@ def main(argv=None):
             encoder.write(s)
         if shot:
             name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
-            save_png(frames_dir / name, s)
+            saves.append(saver.submit(save_png, frames_dir / name, s))
             thumbs.append((t, s))
 
     with (nullcontext() if a.no_video
           else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
                                 preset=a.preset, encoder=a.encoder)) as encoder, \
             VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
-            ThreadPoolExecutor(workers) as pool:
+            ThreadPoolExecutor(workers) as pool, ThreadPoolExecutor(2) as saver:
         # frames are sketched out of order on the pool and written back in order;
         # `pending` caps how many decoded frames are held in memory at once
         pending = deque()
@@ -232,6 +233,8 @@ def main(argv=None):
         while pending:
             t0, shot0, fut = pending.popleft()
             finish(t0, shot0, fut.result())
+        for fut in saves:
+            fut.result()  # surfaces a failed write
         elapsed = time.time() - start
         print(f"\r  read {i} frames in {elapsed:.0f}s ({i / max(elapsed, 1e-9):.0f} fps, {workers} threads)"
               + ("" if a.no_video else "; finishing encode..."))

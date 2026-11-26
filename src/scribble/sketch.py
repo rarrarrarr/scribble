@@ -54,9 +54,9 @@ class Sketcher:
         return img[H // 2:H // 2 + H, W // 2:W // 2 + W]
 
     def gray_and_edges(self, frame):
-        """Contrast-equalised gray and dilated ink edges (uint8): the steps the GPU
-        sketcher also leaves on the CPU, as CuPy has no CLAHE, bilateral or Canny.
-        `frame` is BGR, or already gray (2-D): the look only uses brightness."""
+        """Contrast-equalised gray and dilated ink edges (uint8). gpu_sketch.py has its
+        own copy of these steps. `frame` is BGR, or already gray (2-D): the look only
+        uses brightness."""
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = self.clahe.apply(gray)
         edges = cv2.Canny(cv2.bilateralFilter(gray, 7, 50, 7), 40, 110)
