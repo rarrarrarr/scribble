@@ -1,6 +1,6 @@
 [project]
 name = "scribble-video"
-version = "0.3.0"
+version = "0.3.1"
 description = "Turn a video (or a YouTube link) into a pencil-and-ink sketch"
 readme = "README.md"
 license = "MIT"
