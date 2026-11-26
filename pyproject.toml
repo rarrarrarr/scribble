@@ -20,6 +20,12 @@ scribble = "scribble.cli:main"
 Repository = "https://github.com/rarrarrarr/scribble"
 Issues = "https://github.com/rarrarrarr/scribble/issues"
 
+[project.optional-dependencies]
+gpu = [
+    "cuda-toolkit[cudart,nvrtc]==12.*",
+    "cupy-cuda12x>=14",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"

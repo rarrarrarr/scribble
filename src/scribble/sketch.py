@@ -53,18 +53,32 @@ class Sketcher:
         img = cv2.warpAffine(img, M, (W * 2, H * 2), borderValue=1.0)
         return img[H // 2:H // 2 + H, W // 2:W // 2 + W]
 
+    def gray_and_edges(self, bgr):
+        """Contrast-equalised gray and dilated ink edges (uint8): the steps the GPU
+        sketcher also leaves on the CPU, as CuPy has no CLAHE, bilateral or Canny."""
+        gray = self.clahe.apply(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        edges = cv2.Canny(cv2.bilateralFilter(gray, 7, 50, 7), 40, 110)
+        return gray, cv2.dilate(edges, np.ones((2, 2), np.uint8))
+
+    @staticmethod
+    def wobble(t):
+        """Slight hand wobble that drifts slowly over time: an affine matrix for warpAffine."""
+        k = math.sin(t * 0.7) * 0.6
+        return np.float32([[1, 0.004 * k, 0], [0.003 * k, 1, 0]])
+
+    # warm paper tint (BGR): each channel is out * 255 * a + 255 * b
+    TINT = ((0.93, 0.04), (0.96, 0.025), (1.0, 0.0))
+
     def __call__(self, bgr, t=0.0):
         # Every factor below is in [0, 1], multiplied together in place into `out`;
         # in-place float32 math keeps this fast (numpy temporaries dominated the time).
-        gray = self.clahe.apply(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        gray, edges = self.gray_and_edges(bgr)
         # pencil: table lookup on (gray, blurred inverse of gray)
         idx = gray.astype(np.int32)
         idx <<= 8
         idx += cv2.GaussianBlur(255 - gray, (0, 0), 6)
         out = self.pencil_lut.take(idx)
         # ink outlines: 1 - 0.85 * soft edges
-        edges = cv2.Canny(cv2.bilateralFilter(gray, 7, 50, 7), 40, 110)
-        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8))
         ink = cv2.GaussianBlur(edges.astype(np.float32), (0, 0), 0.7)
         ink *= np.float32(-0.85 / 255.0)
         ink += 1.0
@@ -82,13 +96,10 @@ class Sketcher:
         np.subtract(1.0, dark, out=dark)
         out *= dark
         out *= self.paper
-        # slight hand wobble that drifts slowly over time
-        k = math.sin(t * 0.7) * 0.6
-        M = np.float32([[1, 0.004 * k, 0], [0.003 * k, 1, 0]])
-        out = cv2.warpAffine(out, M, (self.w, self.h), borderMode=cv2.BORDER_REFLECT)
-        # warm paper tint (BGR): scale each channel straight to uint8
+        out = cv2.warpAffine(out, self.wobble(t), (self.w, self.h), borderMode=cv2.BORDER_REFLECT)
+        # scale each channel straight to uint8
         return cv2.merge([(out * np.float32(255 * a) + np.float32(255 * b)).astype(np.uint8)
-                          for a, b in ((0.93, 0.04), (0.96, 0.025), (1.0, 0.0))])
+                          for a, b in self.TINT])
 
 
 def contact_sheet(thumbs, title, cols=6, scale=1 / 3):

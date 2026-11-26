@@ -96,6 +96,21 @@ def shot_frames(cuts, duration, fps, min_shot):
     return {int(m * fps): i + 1 for i, m in enumerate(mids)}
 
 
+def make_sketcher(device, width, height):
+    """(sketcher, 'gpu' or 'cpu'): 'auto' falls back to the CPU, an explicit 'gpu' must work."""
+    if device != "cpu":
+        try:
+            from .gpu_sketch import GpuSketcher
+            return GpuSketcher(width, height), "gpu"
+        except ImportError:
+            why = "CuPy is not installed (install scribble with the gpu extra, see README)"
+        except Exception as e:  # no NVIDIA GPU, driver too old, kernel compile failed, ...
+            why = f"CuPy could not use the GPU: {type(e).__name__}: {e}"
+        if device == "gpu":
+            raise SystemExit(f"--device gpu: {why}")
+    return Sketcher(width, height), "cpu"
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="scribble", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     try:
@@ -118,6 +133,9 @@ def main(argv=None):
                    help="nvenc = NVIDIA GPU, x264 = CPU; auto uses the GPU when it works (default auto)")
     p.add_argument("--preset", default="slow",
                    help="x264 speed preset, e.g. medium, fast, veryfast: faster files are a little bigger (default slow)")
+    p.add_argument("--device", choices=("auto", "gpu", "cpu"), default="auto",
+                   help="where to sketch: gpu = NVIDIA GPU via CuPy (needs the gpu extra, see README), "
+                        "cpu = CPU only; auto uses the GPU when it works (default auto)")
     p.add_argument("--no-video", action="store_true", help="only make frames + contact sheet (much faster)")
     p.add_argument("--workers", type=int, default=0,
                    help="frames sketched in parallel (default: CPU threads, at most 12; 1 = serial)")
@@ -166,11 +184,13 @@ def main(argv=None):
         # parallelism comes from sketching whole frames side by side; OpenCV's own
         # per-call threads on top of that only oversubscribe the cores
         cv2.setNumThreads(1)
-    sketch = Sketcher(W, H)
+    sketch, device = make_sketcher(a.device, W, H)
     video_out = a.out / f"{slug}_scribble.mp4"
-    if not a.no_video:
+    if a.no_video:
+        print(f"sketching shots on the {device.upper()}")
+    else:
         a.encoder = pick_encoder(a.encoder)
-        print(f"rendering with {workers} threads, encoding with {a.encoder}")
+        print(f"sketching on the {device.upper()} with {workers} threads, encoding with {a.encoder}")
     thumbs = []
     start = time.time()
 

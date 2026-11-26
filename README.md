@@ -14,6 +14,16 @@ uv tool install git+https://github.com/rarrarrarr/scribble
 
 This puts a `scribble` command on your PATH. It has its own isolated environment, so nothing is installed into your global Python, and the repo isn't needed afterwards. The dependencies are OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
 
+### Faster on an NVIDIA GPU (optional)
+
+With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about twice as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. Install with it by adding `[gpu]` to the package name:
+
+```shell
+uv tool install "scribble-video[gpu] @ git+https://github.com/rarrarrarr/scribble"
+```
+
+The same command adds the GPU support to a copy you already installed. You need a recent NVIDIA driver (version 525 or newer). You don't need the CUDA toolkit. scribble then uses the GPU automatically (`--device auto`), says `sketching on the GPU` when it does, and falls back to the CPU if the GPU can't be used.
+
 Upgrade with `uv tool upgrade scribble-video` (`scribble --version` shows what you have), and remove it with `uv tool uninstall scribble-video`. The package is named `scribble-video` because `scribble` on PyPI is an unrelated project; the command is still `scribble`.
 
 ## Usage
@@ -35,6 +45,8 @@ uv run scribble "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 ```
 
 `uv run` creates a virtual environment in the repo (`.venv`) on first use, installs the versions pinned in `uv.lock`, and runs your working copy, so code changes take effect right away. It works from any folder inside the repo.
+
+For GPU support in a clone, run `uv sync --extra gpu` once. Later `uv run` commands keep it, but a plain `uv sync` removes it again, so add `--extra gpu` to `uv sync` from then on.
 
 ### Where files go
 
@@ -68,6 +80,7 @@ Links are downloaded into the `source/` folder, and running again reuses that fi
 | `--crf N` | `24` | video quality; lower is better and bigger |
 | `--encoder NAME` | `auto` | `nvenc` encodes on an NVIDIA GPU (needs a recent driver), `x264` on the CPU; `auto` uses the GPU when it works |
 | `--preset NAME` | `slow` | x264 speed preset; `veryfast` renders about 20% sooner |
+| `--device NAME` | `auto` | `gpu` sketches on an NVIDIA GPU (needs the `gpu` extra, see Install), `cpu` on the CPU only; `auto` uses the GPU when it works |
 | `--workers N` | CPU threads, at most 12 | frames sketched in parallel; `1` for one at a time |
 | `--cols N` | `6` | contact sheet columns |
 | `--title TEXT` | video title | contact sheet title (also sets the folder name) |
@@ -87,6 +100,7 @@ All in `src/scribble/`:
 
 - `cli.py`: the `scribble` command; runs each step in order
 - `sketch.py`: the sketch look and the contact sheet layout; edit this to change the style
+- `gpu_sketch.py`: the same look with most of the work on an NVIDIA GPU (CuPy); a style change in `sketch.py` needs the same change here
 - `ffmpeg_tools.py`: scene detection and video encoding
 - `download.py`: downloading links with yt-dlp
 
