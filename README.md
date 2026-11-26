@@ -9,22 +9,26 @@ Turn a video (or a YouTube link) into a pencil-and-ink sketch: one drawing per s
 You need [uv](https://docs.astral.sh/uv/) (Windows, macOS or Linux). It also fetches Python 3.10+ if you don't have it.
 
 ```shell
-uv tool install git+https://github.com/rarrarrarr/scribble
+uv tool install scribble-video
 ```
 
-This puts a `scribble` command on your PATH. It has its own isolated environment, so nothing is installed into your global Python, and the repo isn't needed afterwards. The dependencies are OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
+This puts a `scribble` command on your PATH. The package is named `scribble-video` because `scribble` on PyPI is an unrelated project.
 
 ### Faster on an NVIDIA GPU (optional)
 
-With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about twice as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. Install with it by adding `[gpu]` to the package name:
+With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about twice as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. To install scribble with GPU support, use this instead of the command above:
 
 ```shell
-uv tool install "scribble-video[gpu] @ git+https://github.com/rarrarrarr/scribble"
+uv tool install "scribble-video[gpu]"
 ```
 
-The same command adds the GPU support to a copy you already installed. You need a recent NVIDIA driver (version 525 or newer). You don't need the CUDA toolkit. scribble then uses the GPU automatically (`--device auto`), says `sketching on the GPU` when it does, and falls back to the CPU if the GPU can't be used.
+The quotes stop the shell from treating `[gpu]` as a pattern. If you already installed scribble without it, the same command adds the GPU support. You need a recent NVIDIA driver (version 525 or newer). You don't need the CUDA toolkit. scribble then uses the GPU automatically (`--device auto`), says `sketching on the GPU` when it does, and falls back to the CPU if the GPU can't be used.
 
-Upgrade with `uv tool upgrade scribble-video` (`scribble --version` shows what you have), and remove it with `uv tool uninstall scribble-video`. The package is named `scribble-video` because `scribble` on PyPI is an unrelated project; the command is still `scribble`.
+### What gets installed, upgrading and removing
+
+scribble has its own isolated environment, so nothing is installed into your global Python, and the repo isn't needed afterwards. The dependencies are OpenCV, NumPy, [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), which downloads an ffmpeg binary for you. A system ffmpeg on your PATH is used as a fallback.
+
+Upgrade with `uv tool upgrade scribble-video` (`scribble --version` shows what you have), and remove it with `uv tool uninstall scribble-video`. If you installed it from GitHub before version 0.3.0 (`git+https://...`), run one of the install commands above once (with or without `[gpu]`) to switch to the PyPI releases; upgrades then come from PyPI.
 
 ## Usage
 
@@ -45,6 +49,13 @@ uv run scribble "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 ```
 
 `uv run` creates a virtual environment in the repo (`.venv`) on first use, installs the versions pinned in `uv.lock`, and runs your working copy, so code changes take effect right away. It works from any folder inside the repo.
+
+To install the latest unreleased code as a tool without cloning, install from GitHub instead of PyPI:
+
+```shell
+uv tool install git+https://github.com/rarrarrarr/scribble
+uv tool install "scribble-video[gpu] @ git+https://github.com/rarrarrarr/scribble"   # with GPU support
+```
 
 For GPU support in a clone, run `uv sync --extra gpu` once. Later `uv run` commands keep it, but a plain `uv sync` removes it again, so add `--extra gpu` to `uv sync` from then on.
 
