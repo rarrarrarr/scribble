@@ -3,12 +3,14 @@
 Optional: needs the `gpu` extra (see README). Importing this module raises
 ImportError when CuPy is missing; GpuSketcher() raises when no GPU can run it.
 
-Every step runs here as small CUDA kernels; the CPU only uploads the gray frame and
-downloads the sketch, already converted to the YUV the video encoder takes (half the
-bytes of BGR, and no conversion left for ffmpeg). The BGR image is downloaded only
-for the frames that become shots. CuPy has no CLAHE, bilateral filter or Canny, so this file has
-its own, written to follow OpenCV's (tiles, rounding, borders and thresholds alike):
-on real frames they match OpenCV exactly but for about 0.02% of pixels.
+Every step runs here as small CUDA kernels, replayed per frame as CUDA graphs. With
+ffmpeg decoding and encoding, the CPU only uploads the gray frame and downloads the
+sketch, already converted to the YUV the encoder takes (half the bytes of BGR, and
+no conversion left for ffmpeg); with nv_video (keep_on_gpu), frames arrive and leave
+on the GPU. Either way the BGR image is downloaded only for the frames that become
+shots. CuPy has no CLAHE, bilateral filter or Canny, so this file has its own,
+written to follow OpenCV's (tiles, rounding, borders and thresholds alike): on real
+frames they match OpenCV exactly but for about 0.02% of pixels.
 
 Output matches the CPU Sketcher except for scattered single pixels (about 0.1-0.2%
 of them): OpenCV's 8-bit blur rounds in fixed point, the float blur here can land
@@ -99,19 +101,31 @@ extern "C" __global__ void clahe_apply(const unsigned char* src, unsigned char* 
 
 // ---- bilateral filter (8-bit gray): `space` holds (2r+1)^2 weights, negative outside
 // the circle of radius r; `color` is the weight for each brightness difference 0-255.
+// Blocks of 32x8 threads; r is at most BF_R. The block's pixels and their r-wide border
+// are loaded into shared memory once, rather than every thread reading its (2r+1)^2
+// neighbours from global memory.
+#define BF_R 3
 extern "C" __global__ void bilateral(const unsigned char* src, unsigned char* dst, int w, int h,
                                      const float* space, const float* color, int r) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    __shared__ unsigned char tile[8 + 2 * BF_R][32 + 2 * BF_R];
+    __shared__ float ctab[256];
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    int x0 = blockIdx.x * 32 - r, y0 = blockIdx.y * 8 - r, tw = 32 + 2 * r, th = 8 + 2 * r;
+    for (int i = tid; i < tw * th; i += 256)
+        tile[i / tw][i % tw] = src[reflect101(y0 + i / tw, h) * w + reflect101(x0 + i % tw, w)];
+    ctab[tid] = color[tid];
+    __syncthreads();
+    int x = blockIdx.x * 32 + threadIdx.x, y = blockIdx.y * 8 + threadIdx.y;
     if (x >= w || y >= h) return;
-    int c = src[y * w + x], d = 2 * r + 1;
+    int c = tile[threadIdx.y + r][threadIdx.x + r], d = 2 * r + 1;
     float sum = 0.f, wsum = 0.f;
     for (int dy = -r; dy <= r; dy++) {
-        const unsigned char* row = src + reflect101(y + dy, h) * w;
+        const unsigned char* row = tile[threadIdx.y + r + dy];
         for (int dx = -r; dx <= r; dx++) {
             float sw = space[(dy + r) * d + dx + r];
             if (sw < 0.f) continue;
-            int v = row[reflect101(x + dx, w)];
-            float wt = sw * color[abs(v - c)];
+            int v = row[threadIdx.x + r + dx];
+            float wt = sw * ctab[abs(v - c)];
             sum += v * wt;
             wsum += wt;
         }
@@ -170,7 +184,15 @@ extern "C" __global__ void canny_nms(const int* dxa, const int* dya, const int* 
 // Hysteresis: turn maybes touching a sure edge into sure edges. Each 32x32 block repeats
 // in shared memory until nothing changes, then flags `changed` so the host runs another
 // pass (an edge can cross into the next block).
-extern "C" __global__ void canny_grow(unsigned char* map, int w, int h, int* changed) {
+// Pass number `pass` runs every block if it is 0, otherwise only the blocks the previous
+// pass stamped in `stamp`: a block whose neighbourhood didn't change in the last pass
+// can't change now (it settled then). A block that changes stamps itself and its eight
+// neighbours with this pass's number. (A stale stamp from an earlier frame only costs
+// a block some needless work, never skips one, so stamps are never cleared.)
+extern "C" __global__ void canny_grow(unsigned char* map, int w, int h, int* changed,
+                                      int* stamp, int pass) {
+    int nbx = gridDim.x, nby = gridDim.y;
+    if (pass > 0 && stamp[blockIdx.y * nbx + blockIdx.x] != pass - 1) return;
     __shared__ unsigned char s[34][34];
     __shared__ int any, block_changed;
     int lx = threadIdx.x, ly = threadIdx.y;
@@ -196,7 +218,11 @@ extern "C" __global__ void canny_grow(unsigned char* map, int w, int h, int* cha
     } while (any);
     int x = bx + lx, y = by + ly;
     if (x < w && y < h) map[y * w + x] = s[ly + 1][lx + 1];
-    if (lx == 0 && ly == 0 && block_changed) *changed = 1;
+    if (block_changed && ly < 3 && lx < 3) {  // 9 threads mark the 3x3 blocks around this one
+        int ax = (int)blockIdx.x + lx - 1, ay = (int)blockIdx.y + ly - 1;
+        if (ax >= 0 && ay >= 0 && ax < nbx && ay < nby) stamp[ay * nbx + ax] = pass;
+        if (lx == 1 && ly == 1) *changed = 1;
+    }
 }
 
 // Sure edges -> 255, dilated by OpenCV's 2x2 kernel (anchor at its centre, so each
@@ -223,6 +249,7 @@ __device__ __forceinline__ float col_blur(const float* src, int x, int y, int w,
 
 // Row passes of the three Gaussian blurs, in one launch: blur(255 - gray) (as
 // 255 - blur(gray), the kernel summing to 1), blur(gray / 255) and blur(edges).
+// (Staging rows in shared memory measured no faster here: the cache does it already.)
 extern "C" __global__ void blur_rows(const unsigned char* gray, const unsigned char* edges,
                                      const float* k_inv, int r_inv, const float* k_tone, int r_tone,
                                      const float* k_ink, int r_ink,
@@ -256,11 +283,12 @@ extern "C" __global__ void combine(const unsigned char* gray, const float* inv_r
     out[i] = v * (1.f - dark) * paper[i];
 }
 
-// BGR -> YUV 4:2:0 (I420: all Y, then U, then V), BT.709 limited range, the format the
-// video encoder takes. One thread per 2x2 block; chroma from the block's average.
-// Truncating, as ffmpeg's own conversion does: Y matches it exactly; chroma is within
-// one level (ffmpeg filters chroma a little differently), invisible on a pale tint.
-extern "C" __global__ void to_i420(const unsigned char* bgr, unsigned char* yuv, int w, int h) {
+// BGR -> YUV 4:2:0, BT.709 limited range, the format the video encoder takes: I420
+// (all Y, then U, then V) or, with nv12, NV12 (all Y, then U and V interleaved).
+// One thread per 2x2 block; chroma from the block's average. Truncating, as ffmpeg's
+// own conversion does: Y matches it exactly; chroma is within one level (ffmpeg
+// filters chroma a little differently), invisible on a pale tint.
+extern "C" __global__ void to_yuv420(const unsigned char* bgr, unsigned char* yuv, int w, int h, int nv12) {
     int cx = blockIdx.x * blockDim.x + threadIdx.x, cy = blockIdx.y * blockDim.y + threadIdx.y;
     int cw = w / 2, ch = h / 2;
     if (cx >= cw || cy >= ch) return;
@@ -274,8 +302,15 @@ extern "C" __global__ void to_i420(const unsigned char* bgr, unsigned char* yuv,
     }
     sb *= 0.25f; sg *= 0.25f; sr *= 0.25f;
     float l = 0.0722f * sb + 0.7152f * sg + 0.2126f * sr;
-    yuv[w * h + cy * cw + cx] = (unsigned char)fminf(fmaxf(128.f + (sb - l) * (224.f / 255.f / 1.8556f), 0.f), 255.f);
-    yuv[w * h + cw * ch + cy * cw + cx] = (unsigned char)fminf(fmaxf(128.f + (sr - l) * (224.f / 255.f / 1.5748f), 0.f), 255.f);
+    unsigned char u = (unsigned char)fminf(fmaxf(128.f + (sb - l) * (224.f / 255.f / 1.8556f), 0.f), 255.f);
+    unsigned char v = (unsigned char)fminf(fmaxf(128.f + (sr - l) * (224.f / 255.f / 1.5748f), 0.f), 255.f);
+    if (nv12) {
+        yuv[w * h + cy * w + 2 * cx] = u;
+        yuv[w * h + cy * w + 2 * cx + 1] = v;
+    } else {
+        yuv[w * h + cy * cw + cx] = u;
+        yuv[w * h + cw * ch + cy * cw + cx] = v;
+    }
 }
 
 __device__ __forceinline__ int reflect(int i, int n) {  // OpenCV BORDER_REFLECT
@@ -283,27 +318,29 @@ __device__ __forceinline__ int reflect(int i, int n) {  // OpenCV BORDER_REFLECT
 }
 
 // Wobble (bilinear warp by the inverse affine m) and paper tint, straight to BGR uint8.
-extern "C" __global__ void warp_tint(const float* src, unsigned char* bgr, int w, int h,
-                                     float m0, float m1, float m2, float m3, float m4, float m5,
-                                     float a0, float b0, float a1, float b1, float a2, float b2) {
+// p: the inverse affine m0..m5, then the tint a0, b0, a1, b1, a2, b2 (in GPU memory, so a
+// recorded CUDA graph can replay this with each frame's wobble).
+extern "C" __global__ void warp_tint(const float* src, unsigned char* bgr, int w, int h, const float* p) {
     int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
+    float m0 = p[0], m1 = p[1], m2 = p[2], m3 = p[3], m4 = p[4], m5 = p[5];
+    float a0 = p[6], b0 = p[7], a1 = p[8], b1 = p[9], a2 = p[10], b2 = p[11];
     float sx = m0 * x + m1 * y + m2, sy = m3 * x + m4 * y + m5;
     int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
     float fx = sx - x0, fy = sy - y0;
     int xa = reflect(x0, w), xb = reflect(x0 + 1, w), ya = reflect(y0, h), yb = reflect(y0 + 1, h);
     float v = (src[ya * w + xa] * (1.f - fx) + src[ya * w + xb] * fx) * (1.f - fy)
             + (src[yb * w + xa] * (1.f - fx) + src[yb * w + xb] * fx) * fy;
-    unsigned char* p = bgr + 3 * (y * w + x);
-    p[0] = (unsigned char)(v * a0 + b0);  // truncates, like numpy's astype(uint8)
-    p[1] = (unsigned char)(v * a1 + b1);
-    p[2] = (unsigned char)(v * a2 + b2);
+    unsigned char* o = bgr + 3 * (y * w + x);
+    o[0] = (unsigned char)(v * a0 + b0);  // truncates, like numpy's astype(uint8)
+    o[1] = (unsigned char)(v * a1 + b1);
+    o[2] = (unsigned char)(v * a2 + b2);
 }
 """
 
 
 _KERNELS = ("clahe_lut", "clahe_apply", "bilateral", "sobel", "canny_nms", "canny_grow",
-            "edges_out", "blur_rows", "combine", "warp_tint", "to_i420")
+            "edges_out", "blur_rows", "combine", "warp_tint", "to_yuv420")
 
 
 @lru_cache(maxsize=None)
@@ -323,15 +360,18 @@ def _gauss(sigma, for_uint8):
 class GpuSketch:
     """One sketched frame from GpuSketcher.
 
-    yuv: the frame as the video encoder takes it (I420, BT.709 limited range, uint8,
-    in pinned memory, which copies off the GPU faster), or None if the frame's width
-    or height is odd, which 4:2:0 can't represent. bgr: the frame as a BGR image like
-    Sketcher returns, copied off the GPU only when first asked for (only shots need it).
+    yuv: the frame as ffmpeg's video encoder takes it (I420, BT.709 limited range,
+    uint8, in pinned memory, which copies off the GPU faster), or None if the frame's
+    width or height is odd, which 4:2:0 can't represent, or with keep_on_gpu.
+    nv12: with keep_on_gpu, the frame as NVENC takes it, left on the GPU: a CuPy array
+    of height * 3/2 rows, Y then interleaved UV, BT.709 limited range.
+    bgr: the frame as a BGR image like Sketcher returns, copied off the GPU only when
+    first asked for (only shots need it).
     """
-    __slots__ = ("yuv", "_dev", "_bgr")
+    __slots__ = ("yuv", "nv12", "_dev", "_bgr")
 
-    def __init__(self, yuv, dev):
-        self.yuv, self._dev, self._bgr = yuv, dev, None
+    def __init__(self, yuv, dev, nv12=None):
+        self.yuv, self.nv12, self._dev, self._bgr = yuv, nv12, dev, None
 
     @property
     def bgr(self):
@@ -340,17 +380,32 @@ class GpuSketch:
         return self._bgr
 
 
+class _Work:
+    """One thread's CUDA stream, fixed buffers, and the kernel launches recorded as two
+    CUDA graphs over them (see GpuSketcher.__call__)."""
+
+
 class GpuSketcher(Sketcher):
     """Like Sketcher, but calling it returns a GpuSketch (see there). Safe to call from
-    several threads at once: each thread gets its own CUDA stream, so one frame's
-    copies overlap another's kernels."""
+    several threads at once: each thread gets its own CUDA stream and buffers, so one
+    frame's copies overlap another's kernels.
 
-    GROW_BATCH = 6  # Canny hysteresis passes per check (see _gray_and_edges)
+    The kernels themselves take a fraction of a millisecond per frame; launching some
+    40 of them one by one from Python took longer, so each thread records its launches
+    once as CUDA graphs and replays them per frame with a single call each.
+    """
 
-    def __init__(self, width, height, seed=7):
+    GROW_IN_GRAPH = 12  # Canny hysteresis passes recorded in the graph: most frames settle in ~10
+    GROW_BATCH = 6      # passes per check when a frame needs more
+
+    def __init__(self, width, height, seed=7, keep_on_gpu=False):
+        # keep_on_gpu: frames come in as CuPy arrays (from nv_video.NvDecoder) and go
+        # out as GpuSketch.nv12 for nv_video.NvEncoder; nothing is copied to the CPU.
         super().__init__(width, height, seed)
         self._k = kernels()
-        self.pix_fmt = "yuv420p" if width % 2 == 0 and height % 2 == 0 else "bgr24"
+        self.keep_on_gpu = keep_on_gpu
+        even = width % 2 == 0 and height % 2 == 0
+        self.pix_fmt = "nv12" if keep_on_gpu else "yuv420p" if even else "bgr24"
         # CLAHE(clipLimit=2, 8x8 tiles) as Sketcher.clahe: OpenCV pads the image to whole
         # tiles, by a full extra tile per axis when either size doesn't divide evenly
         self._tiles = (8, 8)
@@ -373,6 +428,7 @@ class GpuSketcher(Sketcher):
         self._hatch = cp.asarray(np.stack([w for w, _ in self.hatch_dark]))
         self._thr = [np.float32(thr / 0.12) for _, thr in self.hatch_dark]
         self._k6, self._k3, self._k07 = _gauss(6, True), _gauss(3, False), _gauss(0.7, False)
+        assert self._bf_r <= 3, "raise BF_R in the kernels"
         self._tls = threading.local()
         # compile and run once now, so a GPU that can't do this fails here, not mid-video
         self(np.zeros((height, width, 3), np.uint8))
@@ -381,68 +437,107 @@ class GpuSketcher(Sketcher):
     def _grid(self):
         return ((self.w + 31) // 32, (self.h + 7) // 8)
 
-    def _gray_and_edges(self, g, stream, flag):
-        """GPU version of Sketcher.gray_and_edges, on a uint8 gray image already on the GPU."""
+    def _work(self):
+        """This thread's _Work, set up (buffers allocated, graphs recorded) on first use."""
+        ws = getattr(self._tls, "work", None)
+        if ws is not None:
+            return ws
+        ws = self._tls.work = _Work()
+        h, w = self.h, self.w
+        ws.stream = cp.cuda.Stream(non_blocking=True)
+        with ws.stream:
+            u8 = lambda *shape: cp.empty(shape or (h, w), cp.uint8)
+            f32 = lambda: cp.empty((h, w), cp.float32)
+            ws.g, ws.gray, ws.smooth, ws.cmap, ws.edges = u8(), u8(), u8(), u8(), u8()
+            ws.lut = u8(self._tiles[0] * self._tiles[1], 256)
+            ws.dx, ws.dy, ws.mag = (cp.empty((h, w), cp.int32) for _ in range(3))
+            ws.inv, ws.tone, ws.ink, ws.out = f32(), f32(), f32(), f32()
+            ws.bgr = u8(h, w, 3)
+            ws.yuv = u8(h * 3 // 2, w)
+            ws.params = cp.zeros(12, cp.float32)  # wobble and tint, see warp_tint
+            ws.flag = cp.zeros(1, cp.int32)
+            n_blocks = ((w + 31) // 32) * ((h + 31) // 32)
+            ws.stamp = cp.full(n_blocks, -1, cp.int32)  # see canny_grow
+            ws.stream.synchronize()
+            # Thread-local capture: other threads keep allocating while this records.
+            mode = cp.cuda.runtime.streamCaptureModeThreadLocal
+            ws.stream.begin_capture(mode)
+            self._front(ws)
+            ws.front = ws.stream.end_capture()
+            ws.stream.begin_capture(mode)
+            self._back(ws)
+            ws.back = ws.stream.end_capture()
+        return ws
+
+    def _front(self, ws):
+        """GPU version of Sketcher.gray_and_edges, from ws.g up to Canny's hysteresis
+        (GROW_IN_GRAPH passes, the last one setting ws.flag if it still changed anything)."""
         k, w, h = self._k, self.w, self.h
         W, H = np.int32(w), np.int32(h)
         tx, ty = self._tiles
         tw, th = self._tile
-        lut = cp.empty((tx * ty, 256), cp.uint8)
-        k["clahe_lut"]((tx * ty,), (256,), (g, W, H, np.int32(tx), np.int32(tw), np.int32(th),
-                                           np.int32(self._clip), np.float32(255.0 / (tw * th)), lut))
-        gray = cp.empty((h, w), cp.uint8)
-        k["clahe_apply"](self._grid, (32, 8), (g, gray, lut, W, H, np.int32(tx), np.int32(ty),
+        k["clahe_lut"]((tx * ty,), (256,), (ws.g, W, H, np.int32(tx), np.int32(tw), np.int32(th),
+                                           np.int32(self._clip), np.float32(255.0 / (tw * th)), ws.lut))
+        k["clahe_apply"](self._grid, (32, 8), (ws.g, ws.gray, ws.lut, W, H, np.int32(tx), np.int32(ty),
                                                np.float32(1.0 / tw), np.float32(1.0 / th)))
-        smooth = cp.empty((h, w), cp.uint8)
-        k["bilateral"](self._grid, (32, 8), (gray, smooth, W, H, self._bf_space, self._bf_color,
+        k["bilateral"](self._grid, (32, 8), (ws.gray, ws.smooth, W, H, self._bf_space, self._bf_color,
                                              np.int32(self._bf_r)))
-        dx, dy, mag = (cp.empty((h, w), cp.int32) for _ in range(3))
-        k["sobel"](self._grid, (32, 8), (smooth, dx, dy, mag, W, H))
-        cmap = cp.empty((h, w), cp.uint8)
-        k["canny_nms"](self._grid, (32, 8), (dx, dy, mag, cmap, W, H, np.int32(40), np.int32(110)))
-        blocks = ((w + 31) // 32, (h + 31) // 32)
-        # Edges usually settle in about 10 passes. Asking the GPU whether a pass changed
-        # anything makes this thread wait, so run passes in batches and only ask about
-        # the last one of each: no change there means done.
-        while True:
-            for _ in range(self.GROW_BATCH - 1):
-                k["canny_grow"](blocks, (32, 32), (cmap, W, H, flag))
-            cp.cuda.runtime.memsetAsync(flag.data.ptr, 0, 4, stream.ptr)
-            k["canny_grow"](blocks, (32, 32), (cmap, W, H, flag))
-            if not int(flag.get(stream=stream)[0]):
-                break
-        edges = cp.empty((h, w), cp.uint8)
-        k["edges_out"](self._grid, (32, 8), (cmap, edges, W, H))
-        return gray, edges
+        k["sobel"](self._grid, (32, 8), (ws.smooth, ws.dx, ws.dy, ws.mag, W, H))
+        k["canny_nms"](self._grid, (32, 8), (ws.dx, ws.dy, ws.mag, ws.cmap, W, H, np.int32(40), np.int32(110)))
+        self._grow(ws, self.GROW_IN_GRAPH)
 
-    def __call__(self, frame, t=0.0):
-        if frame.ndim == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        tls = self._tls
-        if not hasattr(tls, "stream"):
-            tls.stream = cp.cuda.Stream(non_blocking=True)
-            with tls.stream:
-                tls.flag = cp.zeros(1, cp.int32)
-        stream = tls.stream
+    def _grow(self, ws, passes):
+        """Canny hysteresis passes; ws.flag ends up set if the last one changed anything.
+        The first pass looks at every block; later ones only at blocks next to a change."""
+        W, H = np.int32(self.w), np.int32(self.h)
+        blocks = ((self.w + 31) // 32, (self.h + 31) // 32)
+        for i in range(passes):
+            if i == passes - 1:
+                cp.cuda.runtime.memsetAsync(ws.flag.data.ptr, 0, 4, ws.stream.ptr)
+            self._k["canny_grow"](blocks, (32, 32), (ws.cmap, W, H, ws.flag, ws.stamp, np.int32(i)))
+
+    def _back(self, ws):
+        """From the finished Canny map to the sketch: ws.bgr, and ws.yuv unless BGR is wanted."""
         k, w, h = self._k, self.w, self.h
         W, H = np.int32(w), np.int32(h)
-        with stream:
-            g, e = self._gray_and_edges(cp.asarray(frame), stream, tls.flag)
-            blurs = (*self._k6, *self._k3, *self._k07)  # (weights, radius) for inv, tone, ink
-            inv, tone, ink = (cp.empty((h, w), cp.float32) for _ in range(3))
-            k["blur_rows"](self._grid, (32, 8), (g, e, *blurs, inv, tone, ink, W, H))
-            out = cp.empty((h, w), cp.float32)
-            k["combine"](self._grid, (32, 8), (g, inv, tone, ink, *blurs, self._lut, self._hatch,
-                                               self._paper, out, W, H, *self._thr))
-            m = cv2.invertAffineTransform(self.wobble(t)).ravel()
-            tint = [np.float32(v) for a, b in self.TINT for v in (255 * a, 255 * b)]
-            bgr = cp.empty((h, w, 3), cp.uint8)
-            k["warp_tint"](self._grid, (32, 8), (out, bgr, W, H, *map(np.float32, m), *tint))
-            yuv = None
-            if self.pix_fmt == "yuv420p":
-                dev = cp.empty(w * h * 3 // 2, cp.uint8)
-                k["to_i420"](((w // 2 + 31) // 32, (h // 2 + 7) // 8), (32, 8), (bgr, dev, W, H))
-                yuv = np.frombuffer(cp.cuda.alloc_pinned_memory(dev.nbytes), np.uint8, dev.size)
-                dev.get(stream=stream, out=yuv)
-        stream.synchronize()
-        return GpuSketch(yuv, bgr)
+        k["edges_out"](self._grid, (32, 8), (ws.cmap, ws.edges, W, H))
+        blurs = (*self._k6, *self._k3, *self._k07)  # (weights, radius) for inv, tone, ink
+        k["blur_rows"](self._grid, (32, 8), (ws.gray, ws.edges, *blurs, ws.inv, ws.tone, ws.ink, W, H))
+        k["combine"](self._grid, (32, 8), (ws.gray, ws.inv, ws.tone, ws.ink, *blurs, self._lut, self._hatch,
+                                           self._paper, ws.out, W, H, *self._thr))
+        k["warp_tint"](self._grid, (32, 8), (ws.out, ws.bgr, W, H, ws.params))
+        if self.pix_fmt in ("yuv420p", "nv12"):
+            k["to_yuv420"](((w // 2 + 31) // 32, (h // 2 + 7) // 8), (32, 8),
+                           (ws.bgr, ws.yuv, W, H, np.int32(self.pix_fmt == "nv12")))
+
+    def __call__(self, frame, t=0.0):
+        """frame: uint8 gray (2-D) or BGR, a NumPy array, or a CuPy one already on the GPU."""
+        if frame.ndim == 3:
+            frame = cv2.cvtColor(cp.asnumpy(frame), cv2.COLOR_BGR2GRAY)
+        ws = self._work()
+        s = ws.stream
+        m = cv2.invertAffineTransform(self.wobble(t)).ravel()
+        params = np.array([*m, *(v for a, b in self.TINT for v in (255 * a, 255 * b))], np.float32)
+        with s:
+            if isinstance(frame, cp.ndarray):
+                ws.g[...] = frame
+            else:
+                ws.g.set(np.ascontiguousarray(frame), s)
+            ws.params.set(params, s)
+            ws.front.launch(s)
+            # Edges usually settle within the recorded passes. Asking the GPU whether the
+            # last one changed anything makes this thread wait, so when more are needed,
+            # run them in batches and only ask about the last of each.
+            while int(ws.flag.get(stream=s)[0]):
+                self._grow(ws, self.GROW_BATCH)
+            ws.back.launch(s)
+            # copies the caller keeps, so the buffers are free for this thread's next frame
+            bgr = ws.bgr.copy()
+            yuv = nv12 = None
+            if self.pix_fmt == "nv12":
+                nv12 = ws.yuv.copy()
+            elif self.pix_fmt == "yuv420p":
+                yuv = np.frombuffer(cp.cuda.alloc_pinned_memory(ws.yuv.nbytes), np.uint8, ws.yuv.size)
+                ws.yuv.ravel().get(stream=s, out=yuv)
+        s.synchronize()
+        return GpuSketch(yuv, bgr, nv12)

@@ -24,6 +24,7 @@ Issues = "https://github.com/rarrarrarr/scribble/issues"
 gpu = [
     "cuda-toolkit[cudart,nvrtc]==12.*",
     "cupy-cuda12x>=14",
+    "pynvvideocodec>=2.2",
 ]
 
 [build-system]

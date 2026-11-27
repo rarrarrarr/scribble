@@ -359,6 +359,32 @@ wheels = [
 ]
 
 [[package]]
+name = "pynvvideocodec"
+version = "2.2.4"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/6f/42b089a2b4f6391b78aa5b15f905fdbec1673ee2423796896ab8d76b84b3/pynvvideocodec-2.2.4-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:6fb3f279a78723ff1a21d8ca03953caaf6cce4a4ce0fcbbbcd566b22370c72a3", size = 26794503, upload-time = "2026-11-03T10:46:02.845Z" },
+    { url = "https://files.pythonhosted.org/packages/62/24/1ccf0d39896437e094c4efc03015bfe494f9e83a9d67957cab4d5fc5e5dd/pynvvideocodec-2.2.4-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:b9b0d5a6c009eae02f606aac4d7fe79264aa3a7890d945c45e74584bf02ab732", size = 26873422, upload-time = "2026-11-03T10:46:30.509Z" },
+    { url = "https://files.pythonhosted.org/packages/70/a9/9b0fd39eebf437469f16db27a5cca3d34d6bf7f14e67cf1620ef065a89be/pynvvideocodec-2.2.4-cp310-cp310-win_amd64.whl", hash = "sha256:2010ba6cc45eced32182da70e0d15bf561ae83cf0ed95af54ebee2b588b7bd04", size = 20599415, upload-time = "2026-11-03T10:46:51.434Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/23/ff70326b2f7c143bf33736f3bd714550c5c4f8fd63fced68dac1f5d901f6/pynvvideocodec-2.2.4-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:1c3cd1ff54350c47c16464bdf0f7ca1991fa09a1b5ae77bc489e05830876ca71", size = 26794237, upload-time = "2026-11-03T10:47:12.382Z" },
+    { url = "https://files.pythonhosted.org/packages/88/73/3b5a6c1878f4b4f5efe88c5eb4d7d5fcd0fd0abd2b2934f64002bfedc130/pynvvideocodec-2.2.4-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:fa19da4df068341863c651ae72c1a29557bfd3b68f2e8297ccbce7c391d148d6", size = 26873180, upload-time = "2026-11-03T10:47:42.131Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/03/3e74340878a07f77dc68f1493e96d44f4ff0de22314b0d2d71e7baf360d8/pynvvideocodec-2.2.4-cp311-cp311-win_amd64.whl", hash = "sha256:b61dc720fe7285e667dc30b3392bf3330c2d8ef108e9102cbdb5bee20e3cb923", size = 20599429, upload-time = "2026-11-03T10:48:08.169Z" },
+    { url = "https://files.pythonhosted.org/packages/52/ad/0f24f26d331b071c4c649e04104811ae8b5c8731f813c58fee7d363a8901/pynvvideocodec-2.2.4-cp311-cp311-win_arm64.whl", hash = "sha256:aa52cd553f1c15a1f941b0cfc0bd3bcc8ad262d4dcfa1e42c63c9e04cb6209f2", size = 20374303, upload-time = "2026-11-03T10:48:39.467Z" },
+    { url = "https://files.pythonhosted.org/packages/24/d3/54261cbc22744b1d471b99fb8b677974a55d468fcdd8f43fb13f34f61f69/pynvvideocodec-2.2.4-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:62f0bc339d465997e9a78c85f7f396b5c45fc938ea8300fabfa44d437246c763", size = 26790652, upload-time = "2026-11-03T10:49:13.945Z" },
+    { url = "https://files.pythonhosted.org/packages/55/f6/0544f02e89f76459c08da68bda208d4432654e18a378afe34df0728888c9/pynvvideocodec-2.2.4-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:41ad2b4d010ed22eb46c849d3e792789ae06281f6b41767c1b25f76f130aee98", size = 26872497, upload-time = "2026-11-03T10:49:43.618Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/fb/6a13616e829169a3f1c5c88a6fadf15f4c69c7da0927ce81b10e9162e1a7/pynvvideocodec-2.2.4-cp312-cp312-win_amd64.whl", hash = "sha256:7bb8375be3987a3a9dfc2919894aa19784f4bffa2338bfe7686120ae50011446", size = 20604467, upload-time = "2026-11-03T10:50:17.848Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/62/346ba6ec35605a5c9c2dc30f68a0214d939d5ba509ea0e5d0790a812b3fc/pynvvideocodec-2.2.4-cp312-cp312-win_arm64.whl", hash = "sha256:fdac7f9d0b4e8291ff174f4cc567fea6ae1f7bd33e9d1ce5b2ec3e8a06ed5808", size = 20376436, upload-time = "2026-11-03T10:50:45.021Z" },
+    { url = "https://files.pythonhosted.org/packages/22/3d/53e8d7593ed773a3ce4060d9636f65d28db216d3d5908cacd71353c73a87/pynvvideocodec-2.2.4-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:2812d920651e19f3ed3f626e044c79471b20754b58ee9b9afebc71784e41def7", size = 26872525, upload-time = "2026-11-03T10:51:12.598Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/04/fc14409d719b4292e0f4afcfc2255770ae77a6b0a1401c3018d3303fec0d/pynvvideocodec-2.2.4-cp313-cp313-manylinux_2_34_aarch64.whl", hash = "sha256:25e64ae27327d1896343587a8632303ab0f9c984de6ab49c659221c70a8b0726", size = 26773964, upload-time = "2026-11-03T10:51:33.853Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/43/47fd129a8877f8bf54be16e0fdf3c9d4db7bd79710ff0ccc7fd4819d9892/pynvvideocodec-2.2.4-cp313-cp313-win_amd64.whl", hash = "sha256:8bfa2fd929ccb030c47fa83b8fbea5c2d8acb6a217a035a58b1de92232c20118", size = 20604478, upload-time = "2026-11-03T10:52:06.972Z" },
+    { url = "https://files.pythonhosted.org/packages/68/0f/bce7552dc6a1b75104fe2eae6169c1fd6e0ffff25fa5590d19c04a5d4b6a/pynvvideocodec-2.2.4-cp313-cp313-win_arm64.whl", hash = "sha256:b49d83411dd198df3dfdbcd222b29c8eea00414b94b8787c1099a6b2ed50a9df", size = 20376512, upload-time = "2026-11-03T10:52:35.957Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/72/a39081ab3d92033e3cf09e64e09aafd1c8242d1c0499bb9c7ed1127b74c8/pynvvideocodec-2.2.4-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:20edd9c9327b941b21eb365b51eafcbe3efffbcbfdcc9d9819a6e97a02f33050", size = 26870449, upload-time = "2026-11-03T10:53:09.854Z" },
+    { url = "https://files.pythonhosted.org/packages/01/60/8c749b553c831fad21b470a401e84df06bce7bc5f0578d3adadd6ad89be1/pynvvideocodec-2.2.4-cp314-cp314-manylinux_2_34_aarch64.whl", hash = "sha256:179e2be80b6d77fc2f64f632f617b97f0743fdef4ba44a27e4c695d61153f346", size = 26774197, upload-time = "2026-11-03T10:53:43.02Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/d5/ce66d7b0ec512e1a0b4fddbacafcb77cb3870f5a19d381c6bad2567c5d49/pynvvideocodec-2.2.4-cp314-cp314-win_amd64.whl", hash = "sha256:c99c29ff5e86c66db7b25df8f4b433643599660de2749c9ec77008cf63aa12e1", size = 20605906, upload-time = "2026-11-03T10:54:13.384Z" },
+    { url = "https://files.pythonhosted.org/packages/50/4f/121c531032beed6290fd2129d5a49d4653d673eb601d394babaadf7caf8a/pynvvideocodec-2.2.4-cp314-cp314-win_arm64.whl", hash = "sha256:085fe5c04ea7af6a742cc12e26419c00030b4c474084b9d92814d0eb9ac49f83", size = 20377873, upload-time = "2026-11-03T10:54:44.333Z" },
+]
+
+[[package]]
 name = "scribble-video"
 version = "0.3.1"
 source = { editable = "." }
@@ -376,6 +402,7 @@ dependencies = [
 gpu = [
     { name = "cuda-toolkit", extra = ["cudart", "nvrtc"] },
     { name = "cupy-cuda12x" },
+    { name = "pynvvideocodec" },
 ]
 
 [package.metadata]
@@ -385,6 +412,7 @@ requires-dist = [
     { name = "imageio-ffmpeg" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
+    { name = "pynvvideocodec", marker = "extra == 'gpu'", specifier = ">=2.2" },
     { name = "yt-dlp" },
 ]
 provides-extras = ["gpu"]

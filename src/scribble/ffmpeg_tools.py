@@ -121,9 +121,50 @@ class VideoDecoder:
         self._err.close()
 
 
-class SceneDetector:
-    """Finds scene cuts (timestamps, in seconds, where ffmpeg's scene-change score
-    exceeds `threshold`) in a background ffmpeg, so the video can render meanwhile.
+class CutTracker:
+    """What a scene detector shares with the render: cuts found so far (timestamps,
+    in seconds), and how far detection has got. A detector runs in a background
+    thread, calling _scored() per frame (or per batch) and _finished() at the end."""
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.cuts = []
+        self.horizon = float("-inf")  # timestamp of the last frame scored
+        self.done = False
+        self._error = None
+        self._cond = threading.Condition()
+
+    def _scored(self, scores):
+        """scores: (timestamp, scene score) of the next frames, in order."""
+        with self._cond:
+            for t, score in scores:
+                if score > self.threshold:
+                    self.cuts.append(t)
+                self.horizon = t
+            self._cond.notify_all()
+
+    def _finished(self, error=None):
+        with self._cond:
+            self._error = error
+            self.done = True
+            self._cond.notify_all()
+
+    def wait_until(self, t):
+        """(cuts so far, horizon, done) once every cut at or before time t is known."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.done or self.horizon >= t)
+            if self._error:
+                raise self._error
+            return list(self.cuts), self.horizon, self.done
+
+    def result(self):
+        """All the cuts, once detection has finished."""
+        return self.wait_until(float("inf"))[0]
+
+
+class SceneDetector(CutTracker):
+    """Finds scene cuts (where ffmpeg's scene-change score exceeds `threshold`) in a
+    background ffmpeg, so the video can render meanwhile.
 
     ffmpeg prints every frame's score as it goes, so besides the cuts so far this
     knows how far it has got: wait_until(t) returns once every cut up to t is known.
@@ -132,14 +173,9 @@ class SceneDetector:
     """
 
     def __init__(self, video, threshold=0.3, hwaccel=()):
+        super().__init__(threshold)
         cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", "-nostdin", *hwaccel, "-i", str(video), "-an", "-sn",
                "-vf", "select='gte(scene,0)',metadata=print:key=lavfi.scene_score", "-f", "null", "-"]
-        self.threshold = threshold
-        self.cuts = []
-        self.horizon = float("-inf")  # timestamp of the last frame scored
-        self.done = False
-        self._error = None
-        self._cond = threading.Condition()
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                      text=True, errors="replace")
         threading.Thread(target=self._read, daemon=True).start()
@@ -156,29 +192,9 @@ class SceneDetector:
             if m := re.search(r"pts_time:(-?[0-9.]+)", line):
                 t = float(m.group(1))
             elif (m := re.search(r"lavfi\.scene_score=([0-9.]+)", line)) and t is not None:
-                with self._cond:
-                    if float(m.group(1)) > self.threshold:
-                        self.cuts.append(t)
-                    self.horizon = t
-                    self._cond.notify_all()
+                self._scored([(t, float(m.group(1)))])
         rc = self.proc.wait()
-        with self._cond:
-            if rc != 0:
-                self._error = RuntimeError(f"scene detection failed:\n{''.join(tail)[-2000:]}")
-            self.done = True
-            self._cond.notify_all()
-
-    def wait_until(self, t):
-        """(cuts so far, horizon, done) once every cut at or before time t is known."""
-        with self._cond:
-            self._cond.wait_for(lambda: self.done or self.horizon >= t)
-            if self._error:
-                raise self._error
-            return list(self.cuts), self.horizon, self.done
-
-    def result(self):
-        """All the cuts, once detection has finished."""
-        return self.wait_until(float("inf"))[0]
+        self._finished(RuntimeError(f"scene detection failed:\n{''.join(tail)[-2000:]}") if rc else None)
 
     def __enter__(self):
         return self
@@ -211,6 +227,18 @@ def pick_encoder(choice):
     return choice
 
 
+def audio_args(audio_from, out):
+    """ffmpeg options adding the first audio stream of `audio_from` (input 1) to the
+    video (input 0), if it has one: stream-copied when the codec fits the container,
+    otherwise encoded to AAC."""
+    codec = audio_codec(audio_from) if audio_from else None
+    if not codec:
+        return []
+    copy = codec in MP4_SAFE_AUDIO or not str(out).lower().endswith((".mp4", ".m4v", ".mov"))
+    return (["-i", str(audio_from), "-map", "0:v", "-map", "1:a:0", "-shortest"]
+            + (["-c:a", "copy"] if copy else ["-c:a", "aac", "-b:a", "256k"]))
+
+
 class VideoEncoder:
     """Pipe raw BGR frames into ffmpeg (H.264), optionally taking audio from another file.
 
@@ -230,11 +258,7 @@ class VideoEncoder:
         cmd = [ffmpeg_exe(), "-v", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{width}x{height}",
                "-framerate", f"{fps:.6f}", "-i", "-"]
-        codec = audio_codec(audio_from) if audio_from else None
-        if codec:
-            copy = codec in MP4_SAFE_AUDIO or not str(out).lower().endswith((".mp4", ".m4v", ".mov"))
-            cmd += ["-i", str(audio_from), "-map", "0:v", "-map", "1:a:0", "-shortest"]
-            cmd += ["-c:a", "copy"] if copy else ["-c:a", "aac", "-b:a", "256k"]
+        cmd += audio_args(audio_from, out)
         if encoder == "nvenc":
             # NVENC's -cq 21 measured the same size and PSNR as x264 -crf 24 -preset slow
             # on sketch frames, so offset it to keep --crf meaning one quality on both.

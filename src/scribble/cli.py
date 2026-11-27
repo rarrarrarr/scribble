@@ -163,12 +163,28 @@ def warm_gpu():
         pass
 
 
-def make_sketcher(device, width, height):
+def gpu_video_problem(video):
+    """None if the video can be decoded and encoded with frames kept on the GPU
+    (nv_video), else why not. Run during startup, alongside the other checks."""
+    try:
+        from .nv_video import nv_problem
+    except ImportError as e:
+        return f"PyNvVideoCodec or CuPy not installed ({e})"
+    except Exception as e:  # e.g. PyNvVideoCodec finding no NVENC-capable driver
+        return f"{type(e).__name__}: {e}"
+    try:
+        _, _, w, h = pick_decoder(video)
+    except RuntimeError:
+        return "ffmpeg can't decode it either"
+    return nv_problem(video, w, h)
+
+
+def make_sketcher(device, width, height, keep_on_gpu=False):
     """(sketcher, 'gpu' or 'cpu'): 'auto' falls back to the CPU, an explicit 'gpu' must work."""
     if device != "cpu":
         try:
             from .gpu_sketch import GpuSketcher
-            return GpuSketcher(width, height), "gpu"
+            return GpuSketcher(width, height, keep_on_gpu=keep_on_gpu), "gpu"
         except ImportError:
             why = "CuPy is not installed (install scribble with the gpu extra, see README)"
         except Exception as e:  # no NVIDIA GPU, driver too old, kernel compile failed, ...
@@ -240,19 +256,23 @@ def main(argv=None):
     cap.release()
     # Startup checks are each a fraction of a second, mostly waiting on ffmpeg or the
     # GPU, so run them side by side: the results are cached for when they're used.
-    with ThreadPoolExecutor(4) as startup:
+    with ThreadPoolExecutor(5) as startup:
         decoder_probe = startup.submit(pick_decoder, a.video)
         if not a.no_video:
             encoder_check = startup.submit(pick_encoder, a.encoder)
             startup.submit(audio_codec, a.video)
+        nv_check = None
         if a.device != "cpu":
             startup.submit(warm_gpu)
+            if a.no_video or a.encoder != "x264":
+                nv_check = startup.submit(gpu_video_problem, a.video)
         try:
             hwaccel, decoder, W, H = decoder_probe.result()
         except RuntimeError as e:
             sys.exit(str(e))
         if not a.no_video:
             a.encoder = encoder_check.result()
+        nv_why = nv_check.result() if nv_check else "not asked for"
     duration = total / fps
     print(f"{a.video.name}: {W}x{H} @ {fps:.3f} fps, {fmt_time(duration)}")
 
@@ -261,16 +281,33 @@ def main(argv=None):
         # parallelism comes from sketching whole frames side by side; OpenCV's own
         # per-call threads on top of that only oversubscribe the cores
         cv2.setNumThreads(1)
-    sketch, device = make_sketcher(a.device, W, H)
+    # Frames stay on the GPU from decode to encode (nv_video) when everything there
+    # works; otherwise ffmpeg decodes and encodes, and frames cross to the CPU and back.
+    want_gpu_video = nv_why is None and (a.no_video or a.encoder == "nvenc")
+    sketch, device = make_sketcher(a.device, W, H, keep_on_gpu=want_gpu_video)
+    on_gpu = want_gpu_video and device == "gpu"
     # The GPU sketcher returns GpuSketch objects (an encoder-ready YUV frame, and the
     # BGR image on request); the CPU one returns BGR images.
     pix_fmt = getattr(sketch, "pix_fmt", "bgr24")
     def image(s):
         return s.bgr if device == "gpu" else s
-    to_encoder = (lambda s: s.yuv) if pix_fmt == "yuv420p" else image
+    to_encoder = {"nv12": lambda s: s.nv12, "yuv420p": lambda s: s.yuv}.get(pix_fmt, image)
     video_out = a.out / f"{slug}_scribble.mp4"
-    # ffmpeg still decodes on the CPU if the GPU can't handle this codec, so name the option
-    decoding = f"decoding with ffmpeg -hwaccel {decoder}" if decoder != "cpu" else "decoding on the CPU"
+    if on_gpu:
+        from .nv_video import NvDecoder, NvEncoder, NvSceneDetector
+        decoding = "decoding on the GPU (NVDEC)"
+        new_decoder = lambda: NvDecoder(a.video, W, H)
+        new_detector = lambda: NvSceneDetector(a.video, W, H, a.threshold)
+        new_encoder = lambda: NvEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf)
+    else:
+        # ffmpeg still decodes on the CPU if the GPU can't handle this codec, so name the option
+        decoding = f"decoding with ffmpeg -hwaccel {decoder}" if decoder != "cpu" else "decoding on the CPU"
+        if device == "gpu" and nv_why != "not asked for":
+            decoding += f" (not NVDEC: {nv_why})"
+        new_decoder = lambda: VideoDecoder(a.video, W, H, hwaccel, gray=True)
+        new_detector = lambda: SceneDetector(a.video, a.threshold, hwaccel)
+        new_encoder = lambda: VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
+                                           preset=a.preset, encoder=a.encoder, pix_fmt=pix_fmt)
     thumbs = []  # (shot number, time, BGR image)
     saves = []  # PNG writes, done off the main thread (about 30 ms each at 720p)
 
@@ -282,7 +319,7 @@ def main(argv=None):
         thumbs.append((shot, t, img))
 
     picker = ShotPicker(fps, duration, a.min_shot, on_pick)
-    with SceneDetector(a.video, a.threshold, hwaccel) as scenes, ThreadPoolExecutor(2) as saver:
+    with new_detector() as scenes, ThreadPoolExecutor(2) as saver:
         if a.no_video:
             # only the shots get sketched, so find them all first
             print("detecting scene cuts...")
@@ -290,8 +327,9 @@ def main(argv=None):
             print(f"{decoding}, sketching shots on the {device.upper()}")
         else:
             # scene detection runs ahead of the render, which only waits if it catches up
+            encoding = "on the GPU (NVENC)" if on_gpu else f"with {a.encoder}"
             print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, "
-                  f"encoding with {a.encoder}, detecting scene cuts alongside")
+                  f"encoding {encoding}, detecting scene cuts alongside")
         start = time.time()
 
         def finish(i, s):
@@ -302,10 +340,7 @@ def main(argv=None):
                 picker.update(*scenes.wait_until(picker.horizon_to_skip(i)))
             picker.feed(i, s)
 
-        with (nullcontext() if a.no_video
-              else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
-                                preset=a.preset, encoder=a.encoder, pix_fmt=pix_fmt)) as encoder, \
-                VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
+        with (nullcontext() if a.no_video else new_encoder()) as encoder, new_decoder() as frames, \
                 ThreadPoolExecutor(workers) as pool:
             # frames are sketched out of order on the pool and finished in order;
             # `pending` caps how many decoded frames are held in memory at once
