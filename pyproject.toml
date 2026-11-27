@@ -22,7 +22,7 @@ Issues = "https://github.com/rarrarrarr/scribble/issues"
 
 [project.optional-dependencies]
 gpu = [
-    "cuda-toolkit[cudart,nvrtc]==12.*",
+    "cuda-toolkit[cudart,nvrtc]>=12,<14",
     "cupy-cuda12x>=14",
     "pynvvideocodec>=2.2",
 ]
