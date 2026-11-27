@@ -1,8 +1,19 @@
-# Opens a pull request when an action used in .github/workflows has a new release,
-# updating the pinned commit SHA and its version comment together.
+# Opens pull requests when something scribble uses has a new release:
+# - actions used in .github/workflows: updates the pinned commit SHA and its version
+#   comment together
+# - Python packages in uv.lock: one pull request a month with all of them, so the
+#   tests (ci.yml) run against the new versions before you merge
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python-packages:
+        patterns: ["*"]

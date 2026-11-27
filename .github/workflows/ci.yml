@@ -1,0 +1,39 @@
+# Runs the tests on every push to main and on every pull request, on Linux, Windows
+# and macOS, with the oldest Python scribble supports and the newest.
+#
+# GitHub's runners have no GPU, so the GPU tests skip here (the output lists them).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the run still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false  # one failing OS or Python shouldn't hide whether the others pass
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      # --locked: fail if uv.lock is out of date with pyproject.toml, instead of updating it
+      - name: Run the tests
+        run: uv run --locked pytest
