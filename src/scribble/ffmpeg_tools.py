@@ -33,6 +33,7 @@ def _probe(video):
     return r.stderr
 
 
+@lru_cache(maxsize=None)
 def audio_codec(video):
     """Name of the first audio stream's codec, or None if the file has no audio."""
     m = re.search(r"Stream #\S+.*?: Audio: (\w+)", _probe(video))
@@ -220,9 +221,14 @@ class VideoEncoder:
     ffmpeg from a background thread, so write() returns before ffmpeg has taken them.
     """
 
-    def __init__(self, out, width, height, fps, audio_from=None, crf=24, preset="slow", encoder="x264"):
+    def __init__(self, out, width, height, fps, audio_from=None, crf=24, preset="slow", encoder="x264",
+                 pix_fmt="bgr24"):
+        # pix_fmt: what write() gets, 'bgr24' frames (H, W, 3) or 'yuv420p' (I420, already
+        # BT.709 limited range, as GpuSketch.yuv). BGR is converted with that same
+        # matrix, and the video is labelled with it: HD players assume BT.709 for
+        # unlabelled video, while ffmpeg would convert with BT.601 by default.
         cmd = [ffmpeg_exe(), "-v", "error", "-y",
-               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+               "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{width}x{height}",
                "-framerate", f"{fps:.6f}", "-i", "-"]
         codec = audio_codec(audio_from) if audio_from else None
         if codec:
@@ -237,7 +243,11 @@ class VideoEncoder:
                     "-rc", "vbr", "-cq", str(max(crf - 3, 0)), "-b:v", "0"]
         else:
             cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
-        cmd += ["-pix_fmt", "yuv420p", str(out)]
+        # label the frames (ffmpeg now takes colour tags from frames, not output options)
+        vf = "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+        if pix_fmt != "yuv420p":
+            vf = f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{vf}"
+        cmd += ["-vf", vf, "-pix_fmt", "yuv420p", str(out)]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         self._frames = queue.Queue(maxsize=8)
         self._error = None  # set by the writer thread if the pipe breaks

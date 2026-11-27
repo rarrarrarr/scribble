@@ -16,7 +16,7 @@ This puts a `scribble` command on your PATH. The package is named `scribble-vide
 
 ### Faster on an NVIDIA GPU (optional)
 
-With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about three times as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. To install scribble with GPU support, use this instead of the command above:
+With an NVIDIA graphics card, scribble can do most of the drawing on the GPU, which renders videos about six times as fast. That needs [CuPy](https://cupy.dev) and parts of NVIDIA's CUDA libraries, about 350 MB more, so they come as an optional extra named `gpu`. To install scribble with GPU support, use this instead of the command above:
 
 ```shell
 uv tool install "scribble-video[gpu]"

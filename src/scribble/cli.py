@@ -34,7 +34,7 @@ from pathlib import Path
 import cv2
 
 from .download import download, is_url
-from .ffmpeg_tools import SceneDetector, VideoDecoder, VideoEncoder, pick_decoder, pick_encoder
+from .ffmpeg_tools import SceneDetector, VideoDecoder, VideoEncoder, audio_codec, pick_decoder, pick_encoder
 from .sketch import Sketcher, contact_sheet, fmt_time
 
 
@@ -153,6 +153,16 @@ class ShotPicker:
             self.kept[i] = image
 
 
+def warm_gpu():
+    """Import CuPy and compile the GPU kernels ahead of make_sketcher, ignoring failure
+    (make_sketcher reports it)."""
+    try:
+        from .gpu_sketch import kernels
+        kernels()
+    except Exception:
+        pass
+
+
 def make_sketcher(device, width, height):
     """(sketcher, 'gpu' or 'cpu'): 'auto' falls back to the CPU, an explicit 'gpu' must work."""
     if device != "cpu":
@@ -228,10 +238,21 @@ def main(argv=None):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-    try:
-        hwaccel, decoder, W, H = pick_decoder(a.video)
-    except RuntimeError as e:
-        sys.exit(str(e))
+    # Startup checks are each a fraction of a second, mostly waiting on ffmpeg or the
+    # GPU, so run them side by side: the results are cached for when they're used.
+    with ThreadPoolExecutor(4) as startup:
+        decoder_probe = startup.submit(pick_decoder, a.video)
+        if not a.no_video:
+            encoder_check = startup.submit(pick_encoder, a.encoder)
+            startup.submit(audio_codec, a.video)
+        if a.device != "cpu":
+            startup.submit(warm_gpu)
+        try:
+            hwaccel, decoder, W, H = decoder_probe.result()
+        except RuntimeError as e:
+            sys.exit(str(e))
+        if not a.no_video:
+            a.encoder = encoder_check.result()
     duration = total / fps
     print(f"{a.video.name}: {W}x{H} @ {fps:.3f} fps, {fmt_time(duration)}")
 
@@ -241,17 +262,24 @@ def main(argv=None):
         # per-call threads on top of that only oversubscribe the cores
         cv2.setNumThreads(1)
     sketch, device = make_sketcher(a.device, W, H)
+    # The GPU sketcher returns GpuSketch objects (an encoder-ready YUV frame, and the
+    # BGR image on request); the CPU one returns BGR images.
+    pix_fmt = getattr(sketch, "pix_fmt", "bgr24")
+    def image(s):
+        return s.bgr if device == "gpu" else s
+    to_encoder = (lambda s: s.yuv) if pix_fmt == "yuv420p" else image
     video_out = a.out / f"{slug}_scribble.mp4"
     # ffmpeg still decodes on the CPU if the GPU can't handle this codec, so name the option
     decoding = f"decoding with ffmpeg -hwaccel {decoder}" if decoder != "cpu" else "decoding on the CPU"
-    thumbs = []  # (shot number, time, sketch)
+    thumbs = []  # (shot number, time, BGR image)
     saves = []  # PNG writes, done off the main thread (about 30 ms each at 720p)
 
     def on_pick(shot, i, s):
         t = i / fps
         name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
-        saves.append(saver.submit(save_png, frames_dir / name, s))
-        thumbs.append((shot, t, s))
+        img = image(s)
+        saves.append(saver.submit(save_png, frames_dir / name, img))
+        thumbs.append((shot, t, img))
 
     picker = ShotPicker(fps, duration, a.min_shot, on_pick)
     with SceneDetector(a.video, a.threshold, hwaccel) as scenes, ThreadPoolExecutor(2) as saver:
@@ -262,14 +290,13 @@ def main(argv=None):
             print(f"{decoding}, sketching shots on the {device.upper()}")
         else:
             # scene detection runs ahead of the render, which only waits if it catches up
-            a.encoder = pick_encoder(a.encoder)
             print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, "
                   f"encoding with {a.encoder}, detecting scene cuts alongside")
         start = time.time()
 
         def finish(i, s):
             if encoder:
-                encoder.write(s)
+                encoder.write(to_encoder(s))
             picker.update(*scenes.wait_until(i / fps))
             if len(picker.kept) >= picker.KEEP_MAX:  # detection is barely ahead: wait for it
                 picker.update(*scenes.wait_until(picker.horizon_to_skip(i)))
@@ -277,7 +304,7 @@ def main(argv=None):
 
         with (nullcontext() if a.no_video
               else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
-                                preset=a.preset, encoder=a.encoder)) as encoder, \
+                                preset=a.preset, encoder=a.encoder, pix_fmt=pix_fmt)) as encoder, \
                 VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
                 ThreadPoolExecutor(workers) as pool:
             # frames are sketched out of order on the pool and finished in order;

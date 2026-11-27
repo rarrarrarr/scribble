@@ -4,7 +4,9 @@ Optional: needs the `gpu` extra (see README). Importing this module raises
 ImportError when CuPy is missing; GpuSketcher() raises when no GPU can run it.
 
 Every step runs here as small CUDA kernels; the CPU only uploads the gray frame and
-downloads the sketch. CuPy has no CLAHE, bilateral filter or Canny, so this file has
+downloads the sketch, already converted to the YUV the video encoder takes (half the
+bytes of BGR, and no conversion left for ffmpeg). The BGR image is downloaded only
+for the frames that become shots. CuPy has no CLAHE, bilateral filter or Canny, so this file has
 its own, written to follow OpenCV's (tiles, rounding, borders and thresholds alike):
 on real frames they match OpenCV exactly but for about 0.02% of pixels.
 
@@ -16,6 +18,7 @@ sketch.py needs the same change here.
 """
 import threading
 import warnings
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -206,43 +209,73 @@ extern "C" __global__ void edges_out(const unsigned char* map, unsigned char* ds
     dst[y * w + x] = e ? 255 : 0;
 }
 
-// One pass of a separable blur on a uint8 image: dst = blur(src * scale + offset).
-// (dx, dy) is (1, 0) for along rows, (0, 1) for along columns.
-extern "C" __global__ void blur_u8(const unsigned char* src, float* dst, const float* k, int r,
-                                   int w, int h, int dx, int dy, float scale, float offset) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+__device__ __forceinline__ float row_blur(const unsigned char* row, int x, int w, const float* k, int r) {
     float s = 0.f;
-    for (int i = -r; i <= r; i++)
-        s += k[i + r] * src[reflect101(y + i * dy, h) * w + reflect101(x + i * dx, w)];
-    dst[y * w + x] = s * scale + offset;
+    for (int i = -r; i <= r; i++) s += k[i + r] * row[reflect101(x + i, w)];
+    return s;
 }
 
-extern "C" __global__ void blur_f32(const float* src, float* dst, const float* k, int r,
-                                    int w, int h, int dx, int dy) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+__device__ __forceinline__ float col_blur(const float* src, int x, int y, int w, int h, const float* k, int r) {
     float s = 0.f;
-    for (int i = -r; i <= r; i++)
-        s += k[i + r] * src[reflect101(y + i * dy, h) * w + reflect101(x + i * dx, w)];
-    dst[y * w + x] = s;
+    for (int i = -r; i <= r; i++) s += k[i + r] * src[reflect101(y + i, h) * w + x];
+    return s;
 }
 
-// pencil * ink * (1 - strongest hatch layer) * paper, as Sketcher.__call__ does it
-extern "C" __global__ void combine(const unsigned char* gray, const float* inv_blur,
-                                   const float* ink, const float* tone, const float* lut,
+// Row passes of the three Gaussian blurs, in one launch: blur(255 - gray) (as
+// 255 - blur(gray), the kernel summing to 1), blur(gray / 255) and blur(edges).
+extern "C" __global__ void blur_rows(const unsigned char* gray, const unsigned char* edges,
+                                     const float* k_inv, int r_inv, const float* k_tone, int r_tone,
+                                     const float* k_ink, int r_ink,
+                                     float* inv, float* tone, float* ink, int w, int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int i = y * w + x;
+    inv[i] = row_blur(gray + y * w, x, w, k_inv, r_inv) * -1.f + 255.f;
+    tone[i] = row_blur(gray + y * w, x, w, k_tone, r_tone) * (1.f / 255.f);
+    ink[i] = row_blur(edges + y * w, x, w, k_ink, r_ink);
+}
+
+// The blurs' column passes, then pencil * ink * (1 - strongest hatch layer) * paper,
+// as Sketcher.__call__ does it.
+extern "C" __global__ void combine(const unsigned char* gray, const float* inv_rows,
+                                   const float* tone_rows, const float* ink_rows,
+                                   const float* k_inv, int r_inv, const float* k_tone, int r_tone,
+                                   const float* k_ink, int r_ink, const float* lut,
                                    const float* hatch, const float* paper, float* out,
-                                   int n, float t0, float t1, float t2) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    int b = __float2int_rn(inv_blur[i]);  // the CPU blur returns uint8, rounded
+                                   int w, int h, float t0, float t1, float t2) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int i = y * w + x, n = w * h;
+    int b = __float2int_rn(col_blur(inv_rows, x, y, w, h, k_inv, r_inv));  // the CPU blur returns uint8
     float v = lut[gray[i] * 256 + min(max(b, 0), 255)];
-    v *= 1.f + ink[i] * (-0.85f / 255.f);
-    float tn = tone[i] * (-1.f / 0.12f), dark = 0.f;
+    v *= 1.f + col_blur(ink_rows, x, y, w, h, k_ink, r_ink) * (-0.85f / 255.f);
+    float tn = col_blur(tone_rows, x, y, w, h, k_tone, r_tone) * (-1.f / 0.12f), dark = 0.f;
     dark = fmaxf(dark, fminf(fmaxf(tn + t0, 0.f), 1.f) * hatch[i]);
     dark = fmaxf(dark, fminf(fmaxf(tn + t1, 0.f), 1.f) * hatch[n + i]);
     dark = fmaxf(dark, fminf(fmaxf(tn + t2, 0.f), 1.f) * hatch[2 * n + i]);
     out[i] = v * (1.f - dark) * paper[i];
+}
+
+// BGR -> YUV 4:2:0 (I420: all Y, then U, then V), BT.709 limited range, the format the
+// video encoder takes. One thread per 2x2 block; chroma from the block's average.
+// Truncating, as ffmpeg's own conversion does: Y matches it exactly; chroma is within
+// one level (ffmpeg filters chroma a little differently), invisible on a pale tint.
+extern "C" __global__ void to_i420(const unsigned char* bgr, unsigned char* yuv, int w, int h) {
+    int cx = blockIdx.x * blockDim.x + threadIdx.x, cy = blockIdx.y * blockDim.y + threadIdx.y;
+    int cw = w / 2, ch = h / 2;
+    if (cx >= cw || cy >= ch) return;
+    float sb = 0.f, sg = 0.f, sr = 0.f;
+    for (int j = 0; j < 4; j++) {
+        int x = 2 * cx + (j & 1), y = 2 * cy + (j >> 1);
+        const unsigned char* p = bgr + 3 * (y * w + x);
+        float l = 0.0722f * p[0] + 0.7152f * p[1] + 0.2126f * p[2];
+        yuv[y * w + x] = (unsigned char)(16.f + l * (219.f / 255.f));  // truncated, as ffmpeg does
+        sb += p[0]; sg += p[1]; sr += p[2];
+    }
+    sb *= 0.25f; sg *= 0.25f; sr *= 0.25f;
+    float l = 0.0722f * sb + 0.7152f * sg + 0.2126f * sr;
+    yuv[w * h + cy * cw + cx] = (unsigned char)fminf(fmaxf(128.f + (sb - l) * (224.f / 255.f / 1.8556f), 0.f), 255.f);
+    yuv[w * h + cw * ch + cy * cw + cx] = (unsigned char)fminf(fmaxf(128.f + (sr - l) * (224.f / 255.f / 1.5748f), 0.f), 255.f);
 }
 
 __device__ __forceinline__ int reflect(int i, int n) {  // OpenCV BORDER_REFLECT
@@ -269,24 +302,55 @@ extern "C" __global__ void warp_tint(const float* src, unsigned char* bgr, int w
 """
 
 
+_KERNELS = ("clahe_lut", "clahe_apply", "bilateral", "sobel", "canny_nms", "canny_grow",
+            "edges_out", "blur_rows", "combine", "warp_tint", "to_i420")
+
+
+@lru_cache(maxsize=None)
+def kernels():
+    """The compiled CUDA kernels by name. Compiling takes a moment (CuPy caches the
+    result on disk), so the CLI calls this early, alongside its other startup work."""
+    mod = cp.RawModule(code=_SRC)
+    return {n: mod.get_function(n) for n in _KERNELS}
+
+
 def _gauss(sigma, for_uint8):
     """OpenCV's kernel for GaussianBlur(ksize=(0, 0), sigma), whose size depends on the depth."""
     ksize = int(round(sigma * (3 if for_uint8 else 4) * 2 + 1)) | 1
-    return cp.asarray(cv2.getGaussianKernel(ksize, sigma, cv2.CV_32F).ravel()), ksize // 2
+    return cp.asarray(cv2.getGaussianKernel(ksize, sigma, cv2.CV_32F).ravel()), np.int32(ksize // 2)
+
+
+class GpuSketch:
+    """One sketched frame from GpuSketcher.
+
+    yuv: the frame as the video encoder takes it (I420, BT.709 limited range, uint8,
+    in pinned memory, which copies off the GPU faster), or None if the frame's width
+    or height is odd, which 4:2:0 can't represent. bgr: the frame as a BGR image like
+    Sketcher returns, copied off the GPU only when first asked for (only shots need it).
+    """
+    __slots__ = ("yuv", "_dev", "_bgr")
+
+    def __init__(self, yuv, dev):
+        self.yuv, self._dev, self._bgr = yuv, dev, None
+
+    @property
+    def bgr(self):
+        if self._bgr is None:
+            self._bgr, self._dev = cp.asnumpy(self._dev), None
+        return self._bgr
 
 
 class GpuSketcher(Sketcher):
-    """Drop-in for Sketcher. Safe to call from several threads at once: each thread
-    gets its own CUDA stream, so one frame's copies overlap another's kernels."""
+    """Like Sketcher, but calling it returns a GpuSketch (see there). Safe to call from
+    several threads at once: each thread gets its own CUDA stream, so one frame's
+    copies overlap another's kernels."""
 
     GROW_BATCH = 6  # Canny hysteresis passes per check (see _gray_and_edges)
 
     def __init__(self, width, height, seed=7):
         super().__init__(width, height, seed)
-        mod = cp.RawModule(code=_SRC)
-        self._k = {n: mod.get_function(n) for n in (
-            "clahe_lut", "clahe_apply", "bilateral", "sobel", "canny_nms", "canny_grow", "edges_out",
-            "blur_u8", "blur_f32", "combine", "warp_tint")}
+        self._k = kernels()
+        self.pix_fmt = "yuv420p" if width % 2 == 0 and height % 2 == 0 else "bgr24"
         # CLAHE(clipLimit=2, 8x8 tiles) as Sketcher.clahe: OpenCV pads the image to whole
         # tiles, by a full extra tile per axis when either size doesn't divide evenly
         self._tiles = (8, 8)
@@ -312,18 +376,6 @@ class GpuSketcher(Sketcher):
         self._tls = threading.local()
         # compile and run once now, so a GPU that can't do this fails here, not mid-video
         self(np.zeros((height, width, 3), np.uint8))
-
-    def _blur(self, src, kr, scale=1.0, offset=0.0):
-        """Separable blur of a uint8 image, scaled after; returns float32."""
-        k, r = kr
-        w, h = self.w, self.h
-        tmp = cp.empty((h, w), cp.float32)
-        out = cp.empty((h, w), cp.float32)
-        self._k["blur_u8"](self._grid, (32, 8), (src, tmp, k, np.int32(r), np.int32(w), np.int32(h),
-                                                np.int32(1), np.int32(0), np.float32(scale), np.float32(offset)))
-        self._k["blur_f32"](self._grid, (32, 8), (tmp, out, k, np.int32(r), np.int32(w), np.int32(h),
-                                                 np.int32(0), np.int32(1)))
-        return out
 
     @property
     def _grid(self):
@@ -355,7 +407,7 @@ class GpuSketcher(Sketcher):
         while True:
             for _ in range(self.GROW_BATCH - 1):
                 k["canny_grow"](blocks, (32, 32), (cmap, W, H, flag))
-            flag.fill(0)
+            cp.cuda.runtime.memsetAsync(flag.data.ptr, 0, 4, stream.ptr)
             k["canny_grow"](blocks, (32, 32), (cmap, W, H, flag))
             if not int(flag.get(stream=stream)[0]):
                 break
@@ -372,22 +424,25 @@ class GpuSketcher(Sketcher):
             with tls.stream:
                 tls.flag = cp.zeros(1, cp.int32)
         stream = tls.stream
-        w, h, n = self.w, self.h, self.w * self.h
+        k, w, h = self._k, self.w, self.h
+        W, H = np.int32(w), np.int32(h)
         with stream:
             g, e = self._gray_and_edges(cp.asarray(frame), stream, tls.flag)
-            # blur(255 - gray) == 255 - blur(gray): the kernel sums to 1
-            inv_blur = self._blur(g, self._k6, -1.0, 255.0)
-            ink = self._blur(e, self._k07)
-            tone = self._blur(g, self._k3, 1 / 255.0)
+            blurs = (*self._k6, *self._k3, *self._k07)  # (weights, radius) for inv, tone, ink
+            inv, tone, ink = (cp.empty((h, w), cp.float32) for _ in range(3))
+            k["blur_rows"](self._grid, (32, 8), (g, e, *blurs, inv, tone, ink, W, H))
             out = cp.empty((h, w), cp.float32)
-            self._k["combine"](((n + 255) // 256,), (256,),
-                               (g, inv_blur, ink, tone, self._lut, self._hatch, self._paper, out,
-                                np.int32(n), *self._thr))
+            k["combine"](self._grid, (32, 8), (g, inv, tone, ink, *blurs, self._lut, self._hatch,
+                                               self._paper, out, W, H, *self._thr))
             m = cv2.invertAffineTransform(self.wobble(t)).ravel()
             tint = [np.float32(v) for a, b in self.TINT for v in (255 * a, 255 * b)]
-            res = cp.empty((h, w, 3), cp.uint8)
-            self._k["warp_tint"](self._grid, (32, 8),
-                                 (out, res, np.int32(w), np.int32(h), *map(np.float32, m), *tint))
-            host = res.get(stream=stream)
+            bgr = cp.empty((h, w, 3), cp.uint8)
+            k["warp_tint"](self._grid, (32, 8), (out, bgr, W, H, *map(np.float32, m), *tint))
+            yuv = None
+            if self.pix_fmt == "yuv420p":
+                dev = cp.empty(w * h * 3 // 2, cp.uint8)
+                k["to_i420"](((w // 2 + 31) // 32, (h // 2 + 7) // 8), (32, 8), (bgr, dev, W, H))
+                yuv = np.frombuffer(cp.cuda.alloc_pinned_memory(dev.nbytes), np.uint8, dev.size)
+                dev.get(stream=stream, out=yuv)
         stream.synchronize()
-        return host
+        return GpuSketch(yuv, bgr)
