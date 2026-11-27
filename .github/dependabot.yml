@@ -3,17 +3,23 @@
 #   comment together
 # - Python packages in uv.lock: one pull request a month with all of them, so the
 #   tests (ci.yml) run against the new versions before you merge
+# A release is only offered once it's a week old (cooldown): most compromised
+# releases are caught and pulled from PyPI or GitHub within days.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: uv
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     groups:
       python-packages:
         patterns: ["*"]

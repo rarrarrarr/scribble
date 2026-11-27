@@ -148,7 +148,7 @@ git push
 gh release create "v$(uv version --short)" --generate-notes
 ```
 
-The workflow runs the tests (all but the GPU ones) before building, and stops before publishing if any fail. The release tag must also be `v` plus the version in `pyproject.toml`. To check that the tests pass and the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
+The workflow builds the package and runs the tests (all but the GPU ones) on separate machines, so the dependencies the tests run can't change what gets published, and it stops before publishing if any test fails. The release tag must also be `v` plus the version in `pyproject.toml`. To check that the tests pass and the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
 
 PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. Each upload also carries a signed [attestation](https://docs.pypi.org/attestations/), shown under "Verified details" on PyPI, that ties the files to the GitHub repo, workflow and commit that built them.
 
