@@ -34,3 +34,17 @@ build-backend = "uv_build"
 # The package is src/scribble; without this, uv_build would look for src/scribble_video.
 [tool.uv.build-backend]
 module-name = "scribble"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra: list skipped tests with their reasons at the end, so it shows when the GPU ones didn't run
+addopts = "-ra"
+markers = [
+    "gpu: needs an NVIDIA GPU and the gpu extra (skipped otherwise)",
+    "slow: renders whole (short) videos",
+]

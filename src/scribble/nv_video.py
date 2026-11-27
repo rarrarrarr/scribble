@@ -7,8 +7,9 @@ then no frame goes to the CPU except the few that become shot pictures, and ffmp
 only writes the .mp4 from the compressed video, adding the audio.
 
 They reproduce what the ffmpeg pipeline produces:
-- gray frames: ffmpeg's `-pix_fmt gray` goes through RGB (BT.709) and BT.601 luma
-  weights rather than using Y, and nv12_gray does the same; ffmpeg's fixed-point
+- gray frames: ffmpeg's `-pix_fmt gray` goes through RGB (with the video's matrix,
+  BT.601 when unlabelled) and BT.601 luma weights rather than using Y, and nv12_gray
+  does the same (8-bit 4:2:0 video only: nv_problem turns others away); ffmpeg's fixed-point
   arithmetic still lands one level away now and then (about a quarter of pixels,
   0.26 levels on average);
 - scene cuts: ffmpeg's `select` scene score (the mean absolute difference of the Y
@@ -18,12 +19,11 @@ import os
 import queue
 import subprocess
 import threading
-from fractions import Fraction
 from functools import lru_cache
 
 import numpy as np
 
-from .ffmpeg_tools import CutTracker, audio_args, ffmpeg_exe
+from .ffmpeg_tools import CutTracker, audio_args, color_info, exact_rate, ffmpeg_exe
 from .gpu_sketch import cp  # imports CuPy with its warning filter
 
 # PyNvVideoCodec's own logger (read at import) warns about seek accuracy on every
@@ -32,16 +32,22 @@ os.environ.setdefault("LOGGER_LEVEL", "ERROR")
 import PyNvVideoCodec as nvc  # noqa: E402
 
 _SRC = r"""
-// NV12 -> gray as ffmpeg's `-pix_fmt gray` makes it: limited-range BT.709 YUV to RGB,
-// then BT.601 luma weights, truncated; chroma taken from the nearest sample.
+// NV12 -> gray as ffmpeg's `-pix_fmt gray` makes it: YUV to RGB with the video's matrix
+// and range (p, see gray_params), then BT.601 luma weights, truncated; chroma taken
+// from the nearest sample.
 extern "C" __global__ void nv12_gray(const unsigned char* y, int ypitch, const unsigned char* uv,
-                                     int uvpitch, unsigned char* dst, int w, int h) {
+                                     int uvpitch, unsigned char* dst, int w, int h, const float* p) {
     int x = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || r >= h) return;
-    float Y = (y[r * ypitch + x] - 16.f) * (255.f / 219.f);
+    float Y = (y[r * ypitch + x] - p[0]) * p[1];
     const unsigned char* c = uv + (r / 2) * uvpitch + (x / 2) * 2;
-    float cb = (c[0] - 128.f) * (255.f / 224.f), cr = (c[1] - 128.f) * (255.f / 224.f);
-    float red = Y + 1.5748f * cr, green = Y - 0.1873f * cb - 0.4681f * cr, blue = Y + 1.8556f * cb;
+    float cb = (c[0] - 128.f) * p[2], cr = (c[1] - 128.f) * p[2];
+    float red = Y + p[3] * cr, green = Y - p[4] * cb - p[5] * cr, blue = Y + p[6] * cb;
+    if (p[7] != 0.f) {  // colours outside RGB's range are clipped first (ffmpeg does, for BT.709)
+        red = fminf(fmaxf(red, 0.f), 255.f);
+        green = fminf(fmaxf(green, 0.f), 255.f);
+        blue = fminf(fmaxf(blue, 0.f), 255.f);
+    }
     float v = floorf(0.299f * red + 0.587f * green + 0.114f * blue);
     dst[r * w + x] = (unsigned char)fminf(fmaxf(v, 0.f), 255.f);
 }
@@ -79,6 +85,23 @@ def _kernel(name):
 
 def _gray_kernel():
     return _kernel("nv12_gray")
+
+
+def gray_params(video):
+    """nv12_gray's parameters for this video, chosen as ffmpeg chooses: the BT.709
+    matrix if the video is labelled so and BT.601 otherwise (unlabelled too), full
+    range if labelled so and limited otherwise. The labels come from ffmpeg (color_info):
+    PyNvVideoCodec's demuxer misses some, like full range. As float32: Y offset,
+    Y scale, chroma scale, R from Cr, G from Cb, G from Cr, B from Cb, clip RGB?
+    (ffmpeg clips for BT.709, which goes through RGB; for BT.601 its gray is the
+    luma, which never leaves range.)"""
+    matrix, full = color_info(video)
+    y_offset, y_scale, c_scale = (0.0, 1.0, 1.0) if full else (16.0, 255 / 219, 255 / 224)
+    if matrix == "bt709":
+        coeffs, clip = (1.5748, 0.1873, 0.4681, 1.8556), 1.0
+    else:
+        coeffs, clip = (1.402, 0.344136, 0.714136, 1.772), 0.0
+    return np.array([y_offset, y_scale, c_scale, *coeffs, clip], np.float32)
 
 
 def _context():
@@ -127,6 +150,11 @@ def nv_problem(video, width, height):
         dmx = nvc.CreateDemuxer(str(video))
         if (dmx.Width(), dmx.Height()) != (width, height):  # e.g. rotated: ffmpeg turns those
             return f"NVDEC frame size {dmx.Width()}x{dmx.Height()} differs from {width}x{height}"
+        # the kernels here read 8-bit 4:2:0 (NV12); 10-bit or 4:2:2/4:4:4 decode differently
+        if dmx.BitDepth() != 8:
+            return f"{dmx.BitDepth()}-bit video"
+        if dmx.ChromaFormat() != nvc.cudaVideoChromaFormat.__members__["420"]:
+            return f"{dmx.ChromaFormat().name} chroma"
         stream = cp.cuda.Stream(non_blocking=True)
         batches = _batches(video, stream, 1)
         next(batches)
@@ -162,6 +190,8 @@ class NvDecoder:
             w, h = self.w, self.h
             grid = ((w + 31) // 32, (h + 7) // 8)
             W, H = np.int32(w), np.int32(h)
+            with stream:
+                params = cp.asarray(gray_params(self.video))
             for batch in _batches(self.video, stream):
                 if self._stop.is_set():
                     return
@@ -170,7 +200,7 @@ class NvDecoder:
                     for y, ypitch, uv, uvpitch, _ in batch:
                         grays.append(cp.empty((h, w), cp.uint8))
                         kernel(grid, (32, 8), (np.uint64(y), np.int32(ypitch), np.uint64(uv),
-                                               np.int32(uvpitch), grays[-1], W, H))
+                                               np.int32(uvpitch), grays[-1], W, H, params))
                 stream.synchronize()  # done before the decoder reuses its surfaces, and before use
                 for gray in grays:
                     self._frames.put(gray)
@@ -273,7 +303,7 @@ class NvEncoder:
     context manager, calling write(frame) for each frame."""
 
     def __init__(self, out, width, height, fps, audio_from=None, crf=24):
-        rate = Fraction(fps).limit_denominator(100000)  # e.g. 29.97002997 -> 30000/1001
+        rate = exact_rate(fps)  # e.g. 29.97002997 -> 30000/1001
         cmd = [ffmpeg_exe(), "-v", "error", "-y", "-f", "h264", "-framerate", str(rate), "-i", "-"]
         cmd += audio_args(audio_from, out)
         # raw H.264 carries no timestamps (without them the .mp4 muxer drops the audio):

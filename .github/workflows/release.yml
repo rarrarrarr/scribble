@@ -33,6 +33,11 @@ jobs:
             exit 1
           fi
 
+      # GitHub's runners have no GPU, so the GPU tests skip here: run `uv run pytest`
+      # on a machine with one before releasing (see README, Releasing).
+      - name: Run the tests
+        run: uv run pytest
+
       - name: Build
         run: uv build
 

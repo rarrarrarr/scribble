@@ -118,18 +118,37 @@ All in `src/scribble/`:
 - `nv_video.py`: the same on NVIDIA's video engines with frames kept on the GPU (PyNvVideoCodec), used with the `gpu` extra
 - `download.py`: downloading links with yt-dlp
 
+## Tests
+
+```shell
+uv run pytest
+```
+
+This takes about ten seconds. The first run installs pytest into the repo's `.venv`; it's in the `dev` dependency group, which users installing scribble never get. The tests make their own short video from ffmpeg's test patterns, so nothing is downloaded. They're in `tests/`:
+
+- `test_shots.py`: picking each shot's middle frame while scene detection still runs
+- `test_gpu.py`: the GPU versions of OpenCV's and ffmpeg's steps against the originals
+- `test_pipelines.py`: whole renders through each pipeline, and the GPU pipeline against the ffmpeg one
+- `test_look.py`: the look against reference images in `tests/look/`
+- `test_helpers.py`: folder names, frame rates, colour labels, audio
+
+Tests that need an NVIDIA GPU are skipped without one, or without the `gpu` extra (`uv sync --extra gpu`); the end of the output lists what was skipped and why.
+
+After changing the look on purpose, `test_look.py` fails until you rewrite its reference images: run `uv run pytest tests/test_look.py --update-look`, look at the new `tests/look/*.png`, and commit them with the change.
+
 ## Releasing
 
 Publishing a GitHub release uploads the package to [PyPI](https://pypi.org/project/scribble-video/), using [.github/workflows/release.yml](.github/workflows/release.yml):
 
 ```shell
+uv run pytest                    # on a machine with an NVIDIA GPU: GitHub's runners skip those tests
 uv version --bump patch          # or minor / major; updates pyproject.toml and uv.lock
 git commit -am "release v$(uv version --short)"
 git push
 gh release create "v$(uv version --short)" --generate-notes
 ```
 
-The release tag must be `v` plus the version in `pyproject.toml`, or the workflow stops before publishing. To check that the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
+The workflow runs the tests (all but the GPU ones) before building, and stops before publishing if any fail. The release tag must also be `v` plus the version in `pyproject.toml`. To check that the tests pass and the package builds and installs without publishing anything, run the workflow by hand from the Actions tab.
 
 PyPI trusts the workflow itself ([trusted publishing](https://docs.pypi.org/trusted-publishers/)), so no API token is stored. Each upload also carries a signed [attestation](https://docs.pypi.org/attestations/), shown under "Verified details" on PyPI, that ties the files to the GitHub repo, workflow and commit that built them.
 

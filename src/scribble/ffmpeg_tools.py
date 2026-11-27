@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 from collections import deque
+from fractions import Fraction
 from functools import lru_cache
 
 import numpy as np
@@ -31,6 +32,22 @@ def _probe(video):
     r = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", str(video)],
                        capture_output=True, text=True, errors="replace")
     return r.stderr
+
+
+@lru_cache(maxsize=None)
+def color_info(video):
+    """(colour matrix, full range?) of the first video stream as ffmpeg reads its labels,
+    e.g. ('bt709', False); the matrix is None when unlabelled. ffmpeg describes the
+    stream as e.g. 'yuv420p(tv, bt709, progressive)', 'yuvj420p(pc, progressive)' or
+    'yuv420p(tv, bt470bg/bt709/bt709)' (matrix/primaries/transfer when they differ)."""
+    m = re.search(r"Stream #\S+.*?: Video: [^,]+, (\w+)(?:\(([^)]*)\))?", _probe(video))
+    if not m:
+        return None, False
+    pix_fmt, details = m.group(1), [d.strip() for d in (m.group(2) or "").split(",")]
+    full = "pc" in details or pix_fmt.startswith("yuvj")
+    known = ("bt709", "bt470bg", "smpte170m", "bt2020nc", "bt2020c", "smpte240m", "fcc", "gbr", "ycgco")
+    matrix = next((d.split("/")[0] for d in details if d.split("/")[0] in known), None)
+    return matrix, full
 
 
 @lru_cache(maxsize=None)
@@ -225,6 +242,13 @@ def pick_encoder(choice):
         raise SystemExit("--encoder nvenc: ffmpeg could not open the NVIDIA encoder "
                          "(needs an NVIDIA GPU and an up-to-date driver)")
     return choice
+
+
+def exact_rate(fps):
+    """A frame rate as an exact fraction: 29.97002997... -> 30000/1001, 25.0 -> 25.
+    Denominators up to 1001 cover the usual rates (the NTSC ones are n * 1000/1001),
+    and snap a rate stored rounded, like 29.970029, back to 30000/1001."""
+    return Fraction(fps).limit_denominator(1001)
 
 
 def audio_args(audio_from, out):
