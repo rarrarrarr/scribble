@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from collections import deque
 from functools import lru_cache
 
 import numpy as np
@@ -119,15 +120,72 @@ class VideoDecoder:
         self._err.close()
 
 
-def detect_cuts(video, threshold=0.3, hwaccel=()):
-    """Timestamps (seconds) where ffmpeg's scene-change score exceeds `threshold`.
-    `hwaccel` (from pick_decoder) decodes on the GPU; the cuts found are the same."""
-    cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", *hwaccel, "-i", str(video), "-an",
-           "-vf", f"select='gt(scene,{threshold})',showinfo", "-f", "null", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    if r.returncode != 0:
-        raise RuntimeError(f"scene detection failed:\n{r.stderr[-2000:]}")
-    return [float(t) for t in re.findall(r"pts_time:([0-9.]+)", r.stderr)]
+class SceneDetector:
+    """Finds scene cuts (timestamps, in seconds, where ffmpeg's scene-change score
+    exceeds `threshold`) in a background ffmpeg, so the video can render meanwhile.
+
+    ffmpeg prints every frame's score as it goes, so besides the cuts so far this
+    knows how far it has got: wait_until(t) returns once every cut up to t is known.
+    `hwaccel` (from pick_decoder) decodes on the GPU; the cuts found are the same.
+    Use as a context manager.
+    """
+
+    def __init__(self, video, threshold=0.3, hwaccel=()):
+        cmd = [ffmpeg_exe(), "-hide_banner", "-nostats", "-nostdin", *hwaccel, "-i", str(video), "-an", "-sn",
+               "-vf", "select='gte(scene,0)',metadata=print:key=lavfi.scene_score", "-f", "null", "-"]
+        self.threshold = threshold
+        self.cuts = []
+        self.horizon = float("-inf")  # timestamp of the last frame scored
+        self.done = False
+        self._error = None
+        self._cond = threading.Condition()
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                     text=True, errors="replace")
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        # per frame: "[Parsed_metadata_1 @ ...] frame:12 pts:400 pts_time:0.4"
+        # then        "[Parsed_metadata_1 @ ...] lavfi.scene_score=0.012345"
+        tail = deque(maxlen=40)  # for the error message
+        t = None
+        for line in self.proc.stderr:
+            tail.append(line)
+            if "Parsed_metadata" not in line:
+                continue
+            if m := re.search(r"pts_time:(-?[0-9.]+)", line):
+                t = float(m.group(1))
+            elif (m := re.search(r"lavfi\.scene_score=([0-9.]+)", line)) and t is not None:
+                with self._cond:
+                    if float(m.group(1)) > self.threshold:
+                        self.cuts.append(t)
+                    self.horizon = t
+                    self._cond.notify_all()
+        rc = self.proc.wait()
+        with self._cond:
+            if rc != 0:
+                self._error = RuntimeError(f"scene detection failed:\n{''.join(tail)[-2000:]}")
+            self.done = True
+            self._cond.notify_all()
+
+    def wait_until(self, t):
+        """(cuts so far, horizon, done) once every cut at or before time t is known."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.done or self.horizon >= t)
+            if self._error:
+                raise self._error
+            return list(self.cuts), self.horizon, self.done
+
+    def result(self):
+        """All the cuts, once detection has finished."""
+        return self.wait_until(float("inf"))[0]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.proc.poll() is None:  # stopped early: don't leave ffmpeg running
+            self.proc.kill()
+        self.proc.wait()
 
 
 @lru_cache(maxsize=None)
@@ -173,8 +231,9 @@ class VideoEncoder:
             cmd += ["-c:a", "copy"] if copy else ["-c:a", "aac", "-b:a", "256k"]
         if encoder == "nvenc":
             # NVENC's -cq 21 measured the same size and PSNR as x264 -crf 24 -preset slow
-            # on sketch frames, so offset it to keep --crf meaning one quality on both
-            cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            # on sketch frames, so offset it to keep --crf meaning one quality on both.
+            # Preset p4 encodes about 1.3x faster than p5 for the same size and 0.1 dB less PSNR.
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
                     "-rc", "vbr", "-cq", str(max(crf - 3, 0)), "-b:v", "0"]
         else:
             cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]

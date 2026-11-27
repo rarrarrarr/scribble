@@ -34,7 +34,7 @@ from pathlib import Path
 import cv2
 
 from .download import download, is_url
-from .ffmpeg_tools import VideoDecoder, VideoEncoder, detect_cuts, pick_decoder, pick_encoder
+from .ffmpeg_tools import SceneDetector, VideoDecoder, VideoEncoder, pick_decoder, pick_encoder
 from .sketch import Sketcher, contact_sheet, fmt_time
 
 
@@ -89,11 +89,68 @@ def save_png(path, img):
     Path(path).write_bytes(buf.tobytes())
 
 
-def shot_frames(cuts, duration, fps, min_shot):
-    """{frame_index: shot_number} for the middle frame of every shot >= min_shot seconds."""
-    bounds = [0.0] + [c for c in cuts if 0 < c < duration] + [duration]
-    mids = [(a + b) / 2 for a, b in zip(bounds, bounds[1:]) if b - a >= min_shot]
-    return {int(m * fps): i + 1 for i, m in enumerate(mids)}
+class ShotPicker:
+    """Picks the middle frame of every shot of at least `min_shot` seconds (shots run
+    from cut to cut, and from the start and to the end), while the render goes through
+    the frames in order and scene detection is still running ahead of it.
+
+    Call update() with the detector's state, then feed() each frame in order once the
+    detector has got at least that far. on_pick(shot_number, frame_index, image) is
+    called for each middle frame. A frame that might still turn out to be a middle
+    (its shot's end isn't known yet) is kept until it is; with detection ahead of
+    the render, that is rarely any.
+    """
+
+    def __init__(self, fps, duration, min_shot, on_pick):
+        self.fps, self.duration, self.min_shot, self.on_pick = fps, duration, min_shot, on_pick
+        self.start = 0.0      # start of the first shot whose end isn't known yet
+        self.used = 0         # cuts taken from the detector so far
+        self.ended = False    # the last shot has been closed
+        self.shots = 0        # shots numbered so far
+        self.wanted = {}      # frame index -> shot number, for middles not rendered yet
+        self.kept = {}        # frame index -> image, for frames that may be a middle
+        self.horizon = 0.0    # how far detection has got
+
+    def _close(self, end):
+        if end - self.start >= self.min_shot:
+            self.shots += 1
+            mid = int((self.start + end) / 2 * self.fps)
+            if mid in self.kept:
+                self.on_pick(self.shots, mid, self.kept[mid])
+            else:
+                self.wanted[mid] = self.shots
+        self.start = end
+
+    KEEP_MAX = 24  # frames held before the render waits for detection instead (memory)
+
+    def horizon_to_skip(self, i):
+        """How far detection must get for frame i not to need keeping (see _may_be_middle)."""
+        return 2 * (i + 1) / self.fps - self.start + 1e-6
+
+    def _may_be_middle(self, i):
+        # Every shot still to close starts at or after self.start and ends after the
+        # horizon, so its middle frame is at least int((start + horizon) / 2 * fps).
+        # (Deliberately not "is frame i in the open shot": timestamps are rounded to
+        # the millisecond, so a frame can look a hair earlier than the cut it starts.)
+        return not self.ended and i + 1 > (self.start + self.horizon) * self.fps / 2
+
+    def update(self, cuts, horizon, done):
+        for c in cuts[self.used:]:
+            if 0 < c < self.duration:
+                self._close(c)
+        self.used = len(cuts)
+        self.horizon = horizon
+        if done and not self.ended:
+            self._close(self.duration)
+            self.ended = True
+        for j in [j for j in self.kept if not self._may_be_middle(j)]:
+            del self.kept[j]
+
+    def feed(self, i, image):
+        if i in self.wanted:
+            self.on_pick(self.wanted.pop(i), i, image)
+        elif self._may_be_middle(i):
+            self.kept[i] = image
 
 
 def make_sketcher(device, width, height):
@@ -178,12 +235,6 @@ def main(argv=None):
     duration = total / fps
     print(f"{a.video.name}: {W}x{H} @ {fps:.3f} fps, {fmt_time(duration)}")
 
-    print("detecting scene cuts...")
-    cuts = detect_cuts(a.video, a.threshold, hwaccel)
-    (a.out / "cuts.txt").write_text("\n".join(f"{c:.3f}" for c in cuts) + "\n")
-    picks = shot_frames(cuts, duration, fps, a.min_shot)
-    print(f"  {len(cuts)} cuts -> {len(picks)} shots")
-
     workers = max(1, a.workers or min(12, os.cpu_count() or 1))
     if workers > 1:
         # parallelism comes from sketching whole frames side by side; OpenCV's own
@@ -193,52 +244,69 @@ def main(argv=None):
     video_out = a.out / f"{slug}_scribble.mp4"
     # ffmpeg still decodes on the CPU if the GPU can't handle this codec, so name the option
     decoding = f"decoding with ffmpeg -hwaccel {decoder}" if decoder != "cpu" else "decoding on the CPU"
-    if a.no_video:
-        print(f"{decoding}, sketching shots on the {device.upper()}")
-    else:
-        a.encoder = pick_encoder(a.encoder)
-        print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, encoding with {a.encoder}")
-    thumbs = []
+    thumbs = []  # (shot number, time, sketch)
     saves = []  # PNG writes, done off the main thread (about 30 ms each at 720p)
-    start = time.time()
 
-    def finish(t, shot, s):
-        if encoder:
-            encoder.write(s)
-        if shot:
-            name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
-            saves.append(saver.submit(save_png, frames_dir / name, s))
-            thumbs.append((t, s))
+    def on_pick(shot, i, s):
+        t = i / fps
+        name = f"frame_{shot:03d}_{int(t // 60)}m{t % 60:05.2f}s.png"
+        saves.append(saver.submit(save_png, frames_dir / name, s))
+        thumbs.append((shot, t, s))
 
-    with (nullcontext() if a.no_video
-          else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
+    picker = ShotPicker(fps, duration, a.min_shot, on_pick)
+    with SceneDetector(a.video, a.threshold, hwaccel) as scenes, ThreadPoolExecutor(2) as saver:
+        if a.no_video:
+            # only the shots get sketched, so find them all first
+            print("detecting scene cuts...")
+            picker.update(*scenes.wait_until(float("inf")))
+            print(f"{decoding}, sketching shots on the {device.upper()}")
+        else:
+            # scene detection runs ahead of the render, which only waits if it catches up
+            a.encoder = pick_encoder(a.encoder)
+            print(f"{decoding}, sketching on the {device.upper()} with {workers} threads, "
+                  f"encoding with {a.encoder}, detecting scene cuts alongside")
+        start = time.time()
+
+        def finish(i, s):
+            if encoder:
+                encoder.write(s)
+            picker.update(*scenes.wait_until(i / fps))
+            if len(picker.kept) >= picker.KEEP_MAX:  # detection is barely ahead: wait for it
+                picker.update(*scenes.wait_until(picker.horizon_to_skip(i)))
+            picker.feed(i, s)
+
+        with (nullcontext() if a.no_video
+              else VideoEncoder(video_out, W, H, fps, audio_from=a.video, crf=a.crf,
                                 preset=a.preset, encoder=a.encoder)) as encoder, \
-            VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
-            ThreadPoolExecutor(workers) as pool, ThreadPoolExecutor(2) as saver:
-        # frames are sketched out of order on the pool and written back in order;
-        # `pending` caps how many decoded frames are held in memory at once
-        pending = deque()
-        i = 0
-        for frame in frames:
-            t = i / fps
-            shot = picks.get(i)
-            if encoder or shot:
-                pending.append((t, shot, pool.submit(sketch, frame, t)))
-                if len(pending) > 2 * workers:
-                    t0, shot0, fut = pending.popleft()
-                    finish(t0, shot0, fut.result())
-            i += 1
-            if i % 300 == 0:
-                print(f"\r  rendering {i}/{total} ({time.time() - start:.0f}s)", end="", flush=True)
-        while pending:
-            t0, shot0, fut = pending.popleft()
-            finish(t0, shot0, fut.result())
-        for fut in saves:
-            fut.result()  # surfaces a failed write
-        elapsed = time.time() - start
-        print(f"\r  read {i} frames in {elapsed:.0f}s ({i / max(elapsed, 1e-9):.0f} fps, {workers} threads)"
-              + ("" if a.no_video else "; finishing encode..."))
+                VideoDecoder(a.video, W, H, hwaccel, gray=True) as frames, \
+                ThreadPoolExecutor(workers) as pool:
+            # frames are sketched out of order on the pool and finished in order;
+            # `pending` caps how many decoded frames are held in memory at once
+            pending = deque()
+            i = 0
+            for frame in frames:
+                if encoder or i in picker.wanted:
+                    pending.append((i, pool.submit(sketch, frame, i / fps)))
+                    if len(pending) > 2 * workers:
+                        i0, fut = pending.popleft()
+                        finish(i0, fut.result())
+                i += 1
+                if i % 300 == 0:
+                    print(f"\r  rendering {i}/{total} ({time.time() - start:.0f}s)", end="", flush=True)
+            while pending:
+                i0, fut = pending.popleft()
+                finish(i0, fut.result())
+            picker.update(*scenes.wait_until(float("inf")))  # closes the last shot
+            for fut in saves:
+                fut.result()  # surfaces a failed write
+            elapsed = time.time() - start
+            print(f"\r  read {i} frames in {elapsed:.0f}s ({i / max(elapsed, 1e-9):.0f} fps, {workers} threads)"
+                  + ("" if a.no_video else "; finishing encode..."))
+        cuts = scenes.result()
 
+    (a.out / "cuts.txt").write_text("\n".join(f"{c:.3f}" for c in cuts) + "\n")
+    print(f"  {len(cuts)} cuts -> {len(thumbs)} shots")
+    thumbs = [(t, s) for _, t, s in sorted(thumbs, key=lambda x: x[0])]
     save_png(a.out / "contact_sheet.png", contact_sheet(thumbs, title, cols=a.cols))
     print(f"done -> {a.out.resolve()}")
     print(f"  {len(thumbs)} frames, contact_sheet.png" + ("" if a.no_video else f", {video_out.name}"))
